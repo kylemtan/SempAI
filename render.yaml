@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: sempai
+    runtime: node
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: node backend/dist/index.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: KROGER_CLIENT_ID
+        sync: false
+      - key: KROGER_CLIENT_SECRET
+        sync: false
+      - key: APP_URL
+        sync: false
