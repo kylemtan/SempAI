@@ -168,7 +168,10 @@ export default function MealPlanView() {
       </div>
 
       <div className="calendar-wrapper">
-        <div className="calendar-grid">
+        <div
+          className="calendar-grid"
+          style={{ gridTemplateColumns: `repeat(${mealPlan.mealPlan.length}, 1fr)` }}
+        >
           {mealPlan.mealPlan.map((day) => (
             <DayColumn key={day.day} day={day} />
           ))}
