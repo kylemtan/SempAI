@@ -1,7 +1,9 @@
 const KROGER_BASE = 'https://api.kroger.com/v1';
 const REDIRECT_URI = process.env.APP_URL
-  ? `${process.env.APP_URL}/auth/kroger/callback`
+  ? `${process.env.APP_URL.replace(/\/$/, '')}/auth/kroger/callback`
   : 'http://localhost:3001/auth/kroger/callback';
+
+console.log('[Kroger] redirect_uri:', REDIRECT_URI);
 
 const CLIENT_ID = process.env.KROGER_CLIENT_ID ?? '';
 const CLIENT_SECRET = process.env.KROGER_CLIENT_SECRET ?? '';
