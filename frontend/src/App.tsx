@@ -13,7 +13,7 @@ import HelpModal from './components/ui/HelpModal';
 export default function App() {
   const theme = useThemeStore((s) => s.theme);
   const initializeKroger = useKrogerStore((s) => s.initialize);
-  const { mealPlan } = useMealPlanStore();
+  useMealPlanStore();
 
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showFavorites, setShowFavorites] = useState(false);

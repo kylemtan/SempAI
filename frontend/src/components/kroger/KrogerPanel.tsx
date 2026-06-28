@@ -30,7 +30,7 @@ function formatPrice(price: number | null): string {
 function productLabel(opt: ProductOption): string {
   const parts = [opt.brand, opt.description].filter(Boolean);
   const label = parts.join(' ');
-  const meta = [opt.size, formatPrice(opt.price)].filter(Boolean).join(' · ');
+  const meta = [opt.size, formatPrice(opt.regularPrice ?? opt.promoPrice)].filter(Boolean).join(' · ');
   return meta ? `${label} · ${meta}` : label;
 }
 
