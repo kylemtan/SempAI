@@ -24,7 +24,7 @@ async function streamRequest<T>(
   if (res.status === 429) {
     const resetHeader = res.headers.get('RateLimit-Reset');
     const resetAt = resetHeader
-      ? parseInt(resetHeader) * 1000
+      ? Date.now() + parseInt(resetHeader) * 1000
       : Date.now() + 24 * 60 * 60 * 1000;
     throw new Error(`RATE_LIMITED:${resetAt}`);
   }
