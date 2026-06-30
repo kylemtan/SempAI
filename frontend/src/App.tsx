@@ -9,11 +9,16 @@ import BlacklistModal from './components/ui/BlacklistModal';
 import FavoritesModal from './components/ui/FavoritesModal';
 import PantryModal from './components/ui/PantryModal';
 import HelpModal from './components/ui/HelpModal';
+import RateLimitModal from './components/ui/RateLimitModal';
 
 export default function App() {
   const theme = useThemeStore((s) => s.theme);
   const initializeKroger = useKrogerStore((s) => s.initialize);
-  useMealPlanStore();
+  const error = useMealPlanStore((s) => s.error);
+  const clearError = useMealPlanStore((s) => s.clearError);
+
+  const isRateLimited = error?.startsWith('RATE_LIMITED:') ?? false;
+  const rateLimitResetAt = isRateLimited ? parseInt(error!.split(':')[1]) : 0;
 
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showFavorites, setShowFavorites] = useState(false);
@@ -122,6 +127,7 @@ export default function App() {
       {showFavorites && <FavoritesModal onClose={() => setShowFavorites(false)} />}
       {showBlacklist && <BlacklistModal onClose={() => setShowBlacklist(false)} />}
       {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
+      {isRateLimited && <RateLimitModal resetAt={rateLimitResetAt} onClose={clearError} />}
     </div>
   );
 }

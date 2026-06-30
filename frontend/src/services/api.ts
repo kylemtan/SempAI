@@ -21,6 +21,14 @@ async function streamRequest<T>(
     body: JSON.stringify(payload),
   });
 
+  if (res.status === 429) {
+    const resetHeader = res.headers.get('RateLimit-Reset');
+    const resetAt = resetHeader
+      ? parseInt(resetHeader) * 1000
+      : Date.now() + 24 * 60 * 60 * 1000;
+    throw new Error(`RATE_LIMITED:${resetAt}`);
+  }
+
   if (!res.body) throw new Error('No response stream from server');
 
   const reader = res.body.getReader();

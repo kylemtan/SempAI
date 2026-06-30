@@ -18,12 +18,13 @@ const corsOrigin = process.env.CORS_ORIGIN ?? 'http://localhost:5173';
 app.use(cors({ origin: corsOrigin }));
 app.use(express.json());
 
+const isProd = process.env.NODE_ENV === 'production';
 const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10,
+  windowMs: 24 * 60 * 60 * 1000, // 24 hours
+  max: isProd ? 2 : 1000,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { success: false, error: 'Too many requests — please wait 15 minutes before generating again.' },
+  message: { success: false, error: 'rate_limited' },
 });
 
 app.get('/health', (_req, res) => {
