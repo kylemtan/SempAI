@@ -66,14 +66,16 @@ async function getClientToken(): Promise<string> {
 }
 
 // ── User OAuth (cart) ─────────────────────────────────────────────────────────
+// The Kroger token is never held in server memory or on disk — it's handed
+// back to the route layer, which stores it in an httpOnly cookie on the
+// user's browser. That means it survives server restarts (dev-mode file
+// watchers, redeploys, free-tier spin-downs) with no database to run.
 
-interface UserToken {
+export interface UserToken {
   accessToken: string;
   refreshToken: string;
   expiresAt: number;
 }
-
-let userToken: UserToken | null = null;
 
 export function getAuthUrl(): string {
   const params = new URLSearchParams({
@@ -85,7 +87,7 @@ export function getAuthUrl(): string {
   return `${KROGER_BASE}/connect/oauth2/authorize?${params}`;
 }
 
-export async function exchangeCode(code: string): Promise<void> {
+export async function exchangeCode(code: string): Promise<UserToken> {
   const res = await fetch(`${KROGER_BASE}/connect/oauth2/token`, {
     method: 'POST',
     headers: {
@@ -110,56 +112,47 @@ export async function exchangeCode(code: string): Promise<void> {
     expires_in: number;
   };
 
-  userToken = {
+  return {
     accessToken: data.access_token,
     refreshToken: data.refresh_token,
     expiresAt: Date.now() + (data.expires_in - 60) * 1000,
   };
 }
 
-async function getUserToken(): Promise<string> {
-  if (!userToken) throw new Error('Not connected to Kroger. Please connect your account.');
+// Returns a token guaranteed valid for immediate use, refreshing via Kroger
+// first if the one passed in has expired. Callers must persist the returned
+// token back to the cookie — a refresh rotates the access token (and
+// sometimes the refresh token too).
+export async function ensureValidUserToken(token: UserToken): Promise<UserToken> {
+  if (Date.now() < token.expiresAt) return token;
 
-  if (Date.now() >= userToken.expiresAt) {
-    const res = await fetch(`${KROGER_BASE}/connect/oauth2/token`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Authorization: `Basic ${basicAuth()}`,
-      },
-      body: new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: userToken.refreshToken,
-      }).toString(),
-    });
+  const res = await fetch(`${KROGER_BASE}/connect/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Authorization: `Basic ${basicAuth()}`,
+    },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: token.refreshToken,
+    }).toString(),
+  });
 
-    if (!res.ok) {
-      userToken = null;
-      throw new Error('Kroger session expired. Please reconnect your account.');
-    }
-
-    const data = (await res.json()) as {
-      access_token: string;
-      refresh_token?: string;
-      expires_in: number;
-    };
-
-    userToken = {
-      accessToken: data.access_token,
-      refreshToken: data.refresh_token ?? userToken.refreshToken,
-      expiresAt: Date.now() + (data.expires_in - 60) * 1000,
-    };
+  if (!res.ok) {
+    throw new Error('Kroger session expired. Please reconnect your account.');
   }
 
-  return userToken.accessToken;
-}
+  const data = (await res.json()) as {
+    access_token: string;
+    refresh_token?: string;
+    expires_in: number;
+  };
 
-export function isUserConnected(): boolean {
-  return userToken !== null;
-}
-
-export function disconnectUser(): void {
-  userToken = null;
+  return {
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token ?? token.refreshToken,
+    expiresAt: Date.now() + (data.expires_in - 60) * 1000,
+  };
 }
 
 // ── Locations ─────────────────────────────────────────────────────────────────
@@ -210,6 +203,7 @@ export interface ProductOption {
   stockLevel: string | null; // "HIGH" | "LOW" | "TEMPORARILY_OUT_OF_STOCK"
   imageUrl: string | null;
   categories: string[];
+  looksLikeIngredient: boolean;
 }
 
 export interface ProductSearchResult {
@@ -221,7 +215,7 @@ export interface ProductSearchResult {
 // Strip prep descriptors, parentheticals, and "or X" alternatives so
 // "Dried Rice Stick Noodles (Banh Pho, 1/8-Inch Wide)" → "Rice Stick Noodles"
 // "Thinly Sliced Beef Ribeye Or Sirloin" → "Beef Ribeye"
-const PREP_RE = /\b(fresh|dried|cooked|frozen|canned|raw|whole|sliced|thinly\s+sliced|thickly\s+sliced|chopped|minced|diced|shredded|crusty|skin[\s-]on|skin[\s-]off|bone[\s-]in|bone[\s-]less|trimmed|peeled|halved|quartered|toasted|roasted|sprigs?|stalks?|bunches?)\b/gi;
+const PREP_RE = /\b(fresh|dried|cooked|frozen|canned|raw|whole|sliced|thinly\s+sliced|thickly\s+sliced|chopped|minced|diced|shredded|crusty|skin[\s-]on|skin[\s-]off|bone[\s-]in|bone[\s-]less|trimmed|peeled|halved|quartered|toasted|roasted|sprigs?|stalks?|bunches?|leaves?)\b/gi;
 
 function simplifySearchTerm(raw: string): string {
   const s = raw
@@ -237,6 +231,40 @@ function simplifySearchTerm(raw: string): string {
 function coreSearchTerm(simplified: string): string {
   const words = simplified.split(/\s+/).filter(Boolean);
   return words.slice(-Math.min(2, words.length)).join(' ');
+}
+
+// Recipe-speak vs. retail-speak naming differences — mirrors the alias table
+// used for match scoring on the frontend (ShoppingListModal.tsx), duplicated
+// here since the two projects don't share code. Used to retry the *search
+// itself* when the original term returns nothing — e.g. Kroger's catalog may
+// index "green onion" but return zero results for "scallions", which no
+// amount of re-scoring existing results can fix. Not exhaustive — extend as
+// new mismatches turn up (keep both copies in sync).
+const INGREDIENT_ALIASES: [RegExp, string][] = [
+  [/\bscallions?\b/g, 'green onion'],
+  [/\bspring onions?\b/g, 'green onion'],
+  [/\bcilantro\b/g, 'coriander'],
+  [/\bgarbanzo(?:\s+beans?)?s?\b/g, 'chickpea'],
+  [/\barugula\b/g, 'rocket'],
+  [/\beggplants?\b/g, 'aubergine'],
+  [/\bzucchinis?\b/g, 'courgette'],
+  [/\bshrimps?\b/g, 'prawn'],
+  [/\bjalape[nñ]os?\b/g, 'jalapeno'],
+  [/\b(?:powdered|icing)\s+sugar\b/g, 'confectioners sugar'],
+  [/\ball-purpose flour\b/g, 'plain flour'],
+  [/\bheavy cream\b/g, 'heavy whipping cream'],
+  [/\bstring beans?\b/g, 'green bean'],
+  [/\bsnow peas?\b/g, 'mangetout'],
+  [/\bromaine\b/g, 'cos lettuce'],
+  [/\bchil(?:i|e)s?\b/g, 'chili'],
+];
+
+function aliasSearchTerm(term: string): string {
+  let t = term.toLowerCase();
+  for (const [pattern, canonical] of INGREDIENT_ALIASES) {
+    t = t.replace(pattern, canonical);
+  }
+  return t;
 }
 
 type KrogerProductRaw = {
@@ -256,6 +284,60 @@ type KrogerProductRaw = {
     sizes: { id: string; url: string }[];
   }[];
 };
+
+// Kroger's own search relevance ranking sometimes surfaces off-category matches
+// for ingredient searches — e.g. "mint leaves" returning breath-mint gum, since
+// both share the word "mint". Category is a much stronger signal than text
+// overlap here: a recipe ingredient is never going to be gum, toothpaste, or
+// pet food, regardless of how well the product name matches.
+const NON_FOOD_CATEGORY_KEYWORDS = [
+  'candy', 'gum', 'mints',
+  'personal care', 'beauty', 'cosmetic', 'hair care', 'oral care', 'skin care', 'deodorant',
+  'household', 'cleaning', 'laundry', 'paper product', 'plastic wrap', 'foil',
+  'pet ', 'baby', 'diaper',
+  'office', 'school supplies', 'automotive', 'electronics',
+  'toy', 'greeting card', 'floral', 'tobacco',
+  'vitamin', 'supplement', 'medicine', 'first aid',
+];
+
+function isLikelyNonFood(categories: string[]): boolean {
+  const joined = categories.join(' ').toLowerCase();
+  return NON_FOOD_CATEGORY_KEYWORDS.some((kw) => joined.includes(kw));
+}
+
+// Departments that plausibly sell raw/whole cooking ingredients. This is a
+// *soft* signal, not a hard filter — a product outside all of these isn't
+// excluded (sometimes it's genuinely the only thing a store carries), it's
+// just marked as not looking like an ingredient so the frontend can weigh it
+// against the alternatives and flag it for the user to double-check instead
+// of presenting it as a confirmed match.
+//
+// This is deliberately an allowlist of the departments ingredients actually
+// live in, rather than a denylist of wrong departments — snacks, beverages,
+// candy, and cereal all routinely borrow flavor names from real ingredients
+// ("Lemongrass Sparkling Water", "Green Onion Potato Chips", "Jasmine Flavored
+// Rice"), and there's no way to enumerate every product category that might
+// do this next. Listing the departments that ARE ingredients is a much
+// smaller, more stable list than listing every department that ISN'T.
+const INGREDIENT_DEPARTMENT_KEYWORDS = [
+  'produce', 'fruit', 'vegetable', 'herb',
+  'meat', 'seafood', 'poultry', 'deli', 'tofu',
+  'dairy', 'egg', 'cheese',
+  'bakery', 'bread',
+  'pasta', 'rice', 'grain', 'noodle', 'bean', 'legume',
+  'canned', 'jarred', 'broth', 'stock', 'pickle',
+  'condiment', 'sauce', 'dressing',
+  'spice', 'season',
+  'baking', 'flour', 'sugar',
+  'frozen fruit', 'frozen vegetable',
+  'international', 'ethnic', 'asian', 'hispanic', 'mexican', 'indian',
+  'oil', 'vinegar', 'nut', 'seed',
+];
+
+function looksLikeIngredientDepartment(categories: string[]): boolean {
+  const joined = categories.join(' ').toLowerCase();
+  return INGREDIENT_DEPARTMENT_KEYWORDS.some((kw) => joined.includes(kw));
+}
 
 async function queryProducts(term: string, locationId: string, limit: number): Promise<ProductOption[]> {
   const token = await getClientToken();
@@ -280,28 +362,31 @@ async function queryProducts(term: string, locationId: string, limit: number): P
   }
   const data = (await res.json()) as { data: KrogerProductRaw[] };
 
-  return (data.data ?? []).map((p) => {
-    const item = p.items?.[0];
-    const frontImg = p.images?.find((img) => img.perspective === 'front') ?? p.images?.[0];
-    const imageUrl =
-      frontImg?.sizes.find((s) => s.id === 'small')?.url ??
-      frontImg?.sizes.find((s) => s.id === 'thumbnail')?.url ??
-      frontImg?.sizes[0]?.url ??
-      null;
+  return (data.data ?? [])
+    .filter((p) => !isLikelyNonFood(p.categories ?? []))
+    .map((p) => {
+      const item = p.items?.[0];
+      const frontImg = p.images?.find((img) => img.perspective === 'front') ?? p.images?.[0];
+      const imageUrl =
+        frontImg?.sizes.find((s) => s.id === 'small')?.url ??
+        frontImg?.sizes.find((s) => s.id === 'thumbnail')?.url ??
+        frontImg?.sizes[0]?.url ??
+        null;
 
-    return {
-      productId: p.productId,
-      brand: p.brand ?? '',
-      description: p.description,
-      size: item?.size ?? '',
-      soldBy: item?.soldBy ?? '',
-      regularPrice: item?.price?.regular ?? null,
-      promoPrice: item?.price?.promo ?? null,
-      stockLevel: item?.inventory?.stockLevel ?? null,
-      imageUrl,
-      categories: p.categories ?? [],
-    };
-  });
+      return {
+        productId: p.productId,
+        brand: p.brand ?? '',
+        description: p.description,
+        size: item?.size ?? '',
+        soldBy: item?.soldBy ?? '',
+        regularPrice: item?.price?.regular ?? null,
+        promoPrice: item?.price?.promo ?? null,
+        stockLevel: item?.inventory?.stockLevel ?? null,
+        imageUrl,
+        categories: p.categories ?? [],
+        looksLikeIngredient: looksLikeIngredientDepartment(p.categories ?? []),
+      };
+    });
 }
 
 async function findProductOptions(term: string, locationId: string, limit = 50): Promise<ProductOption[]> {
@@ -309,6 +394,15 @@ async function findProductOptions(term: string, locationId: string, limit = 50):
 
   const r1 = await queryProducts(simplified, locationId, limit);
   if (r1.length > 0) return r1;
+
+  // Retry with retail-speak naming before falling back to a blunter
+  // truncation — an alias substitution preserves more of the original
+  // meaning than just chopping the term down to its last couple of words.
+  const aliased = aliasSearchTerm(simplified);
+  if (aliased !== simplified.toLowerCase()) {
+    const r2 = await queryProducts(aliased, locationId, limit);
+    if (r2.length > 0) return r2;
+  }
 
   const core = coreSearchTerm(simplified);
   if (core !== simplified) return queryProducts(core, locationId, limit);
@@ -342,17 +436,21 @@ export interface CartItem {
 export interface CartSelection {
   productId: string;
   displayName: string;
+  quantity: number;
 }
 
-export async function addProductsToCart(selections: CartSelection[]): Promise<{ added: string[] }> {
-  if (selections.length === 0) return { added: [] };
+export async function addProductsToCart(
+  selections: CartSelection[],
+  userToken: UserToken
+): Promise<{ added: string[]; token: UserToken }> {
+  if (selections.length === 0) return { added: [], token: userToken };
 
-  const token = await getUserToken();
+  const token = await ensureValidUserToken(userToken);
   const cartRes = await fetch(`${KROGER_BASE}/cart/add`, {
     method: 'PUT',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    headers: { Authorization: `Bearer ${token.accessToken}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      items: selections.map(({ productId }) => ({ quantity: 1, upc: productId })),
+      items: selections.map(({ productId, quantity }) => ({ quantity: quantity || 1, upc: productId })),
     }),
   });
 
@@ -361,5 +459,5 @@ export async function addProductsToCart(selections: CartSelection[]): Promise<{ 
     throw new Error(`Failed to add items to cart: ${err}`);
   }
 
-  return { added: selections.map((s) => s.displayName) };
+  return { added: selections.map((s) => s.displayName), token };
 }

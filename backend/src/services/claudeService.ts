@@ -44,6 +44,7 @@ export interface MealPlanRequest {
   pinnedRecipes?: { name: string; cuisineHint: string; mealType: string }[];
   slotsToGenerate?: SlotToGenerate[];
   existingDayMeals?: DayContext[];
+  searchMode?: 'web' | 'training';
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -442,6 +443,8 @@ export async function generateMealPlan(
   req: MealPlanRequest,
   onProgress: (msg: string) => void = () => {}
 ): Promise<unknown> {
+  if (req.searchMode === 'training') return generateMealPlanFromTraining(req, onProgress);
+
   // Phase 1 — Plan which recipes to use
   onProgress('Choosing recipes based on your preferences…');
   const planMsg = await client.messages.create({
@@ -522,6 +525,7 @@ export async function regenerateMeals(
   req: MealPlanRequest,
   onProgress: (msg: string) => void = () => {}
 ): Promise<unknown> {
+  if (req.searchMode === 'training') return regenerateMealsFromTraining(req, onProgress);
   if (!req.slotsToGenerate?.length) throw new Error('No slots specified for regeneration');
 
   // Phase 1 — Plan only the specified slots
@@ -557,4 +561,157 @@ export async function regenerateMeals(
     const src = enriched.find((r) => r.day === m.day && r.mealType === m.mealType);
     return { ...m, recipe: { ...m.recipe, sourceUrl: src?.sourceUrl ?? null, imageUrl: src?.imageUrl ?? null } };
   });
+}
+
+// ── Training-only pipeline — Claude generates recipes from its own knowledge,
+// no Tavily search/extract step. One Claude call does selection + synthesis
+// together, instead of the plan → search → synthesize chain used above.
+
+const TRAINING_RULES = `CRITICAL RULES:
+1. Return ONLY raw valid JSON. No prose, no markdown, no code fences.
+2. Invent each recipe yourself from your own training knowledge — do not claim to have searched or retrieved anything from the web.
+3. Set "sourceSite" to "Claude" for every recipe.
+4. Estimate macros accurately and consistently with the ingredient quantities you specify.
+5. Strictly respect all dietary restrictions, allergen exclusions, per-meal macro limits (including minimum protein targets), and the remaining day budget where provided.
+6. Never include any blacklisted recipe.`;
+
+const TRAINING_DAY_SYSTEM = `You are a professional chef and meal planner. You do not have web access for this task — invent realistic, cookable recipes entirely from your own training knowledge.
+
+${TRAINING_RULES}
+
+Return a JSON ARRAY of meal objects for the day — one entry per meal slot:
+[
+  { "mealType": "breakfast", "recipe": ${RECIPE_SCHEMA} }
+]`;
+
+const TRAINING_REGEN_SYSTEM = `You are a professional chef and meal planner. You do not have web access for this task — invent realistic, cookable recipes entirely from your own training knowledge.
+
+${TRAINING_RULES}
+
+Return a JSON ARRAY (not an object) matching EXACTLY this schema:
+[
+  {
+    "day": "Monday",
+    "date": "YYYY-MM-DD",
+    "mealType": "breakfast",
+    "recipe": ${RECIPE_SCHEMA}
+  }
+]`;
+
+// Deterministically spreads pinned recipes across days so each pinned recipe
+// is generated exactly once (no separate cross-day planning call to dedupe them).
+function assignPinnedToDays(
+  pinnedRecipes: { name: string; cuisineHint: string; mealType: string }[] | undefined,
+  days: { day: string; date: string }[]
+): Map<string, { name: string; cuisineHint: string; mealType: string }[]> {
+  const byDay = new Map<string, { name: string; cuisineHint: string; mealType: string }[]>();
+  if (!pinnedRecipes?.length) return byDay;
+
+  const usedDaysForType = new Map<string, Set<string>>();
+  for (const pinned of pinnedRecipes) {
+    const usedDays = usedDaysForType.get(pinned.mealType) ?? new Set<string>();
+    const target = days.find((d) => !usedDays.has(d.day));
+    if (!target) continue;
+    usedDays.add(target.day);
+    usedDaysForType.set(pinned.mealType, usedDays);
+    byDay.set(target.day, [...(byDay.get(target.day) ?? []), pinned]);
+  }
+  return byDay;
+}
+
+function buildTrainingDayMessage(
+  req: MealPlanRequest,
+  day: { day: string; date: string },
+  pinnedForDay: { name: string; cuisineHint: string; mealType: string }[]
+): string {
+  const mealTypes = getMealTypes(req.mealsPerDay);
+  const pinnedSection = pinnedForDay.length
+    ? `\nREQUIRED RECIPES TO INCLUDE (assign to the matching meal type; still write full original content for it):\n${pinnedForDay.map((p) => `- "${p.name}" (${p.cuisineHint}) as ${p.mealType}`).join('\n')}`
+    : '';
+
+  return `Generate a full day of meals for ${day.day} (${day.date}). Meal slots: ${mealTypes.join(', ')}.
+${pinnedSection}
+
+USER PREFERENCES:
+${preferenceSummary(req)}
+${perMealTargetsSection(req)}
+${allergenGuardSection(req.dietary.allergens)}`;
+}
+
+function stampAiGenerated(recipe: Record<string, unknown>): Record<string, unknown> {
+  return { ...recipe, sourceSite: 'Claude', sourceUrl: null, imageUrl: null, aiGenerated: true };
+}
+
+async function synthesizeTrainingDay(
+  req: MealPlanRequest,
+  day: { day: string; date: string },
+  pinnedForDay: { name: string; cuisineHint: string; mealType: string }[]
+): Promise<{ mealType: string; recipe: unknown }[]> {
+  const msg = await client.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 6000,
+    system: TRAINING_DAY_SYSTEM,
+    messages: [{ role: 'user', content: buildTrainingDayMessage(req, day, pinnedForDay) }],
+  });
+  const raw = msg.content[0];
+  if (raw.type !== 'text') throw new Error(`Unexpected response synthesizing ${day.day}`);
+  return parseJSON(raw.text) as { mealType: string; recipe: unknown }[];
+}
+
+export async function generateMealPlanFromTraining(
+  req: MealPlanRequest,
+  onProgress: (msg: string) => void = () => {}
+): Promise<unknown> {
+  onProgress('Generating recipes from training knowledge…');
+  const { weekOf, days } = getPlanDates(req.startDate, req.numDays);
+  const pinnedByDay = assignPinnedToDays(req.pinnedRecipes, days);
+
+  let daysWritten = 0;
+  const mealPlanDays = await Promise.all(
+    days.map(async (d) => {
+      const meals = await synthesizeTrainingDay(req, d, pinnedByDay.get(d.day) ?? []);
+      onProgress(`(${++daysWritten}/${days.length})`);
+      const stampedMeals = meals.map((meal) => ({
+        ...meal,
+        recipe: stampAiGenerated(meal.recipe as Record<string, unknown>),
+      }));
+      return { day: d.day, date: d.date, meals: stampedMeals };
+    })
+  );
+
+  const shoppingList = buildShoppingList(mealPlanDays);
+  return { weekOf, mealPlan: mealPlanDays, shoppingList };
+}
+
+function buildTrainingRegenMessage(req: MealPlanRequest): string {
+  const slots = req.slotsToGenerate ?? [];
+  return `Generate replacement recipes for the specific meal slots listed below.
+
+MEAL SLOTS TO FILL:
+${slots.map((s) => `${s.day} ${s.date} — ${s.mealType}`).join('\n')}
+
+USER PREFERENCES:
+${preferenceSummary(req)}
+${allergenGuardSection(req.dietary.allergens)}
+${dayContextSection(req)}`;
+}
+
+export async function regenerateMealsFromTraining(
+  req: MealPlanRequest,
+  onProgress: (msg: string) => void = () => {}
+): Promise<unknown> {
+  if (!req.slotsToGenerate?.length) throw new Error('No slots specified for regeneration');
+
+  onProgress('Generating replacement recipes from training knowledge…');
+  const synthMsg = await client.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 6000,
+    system: TRAINING_REGEN_SYSTEM,
+    messages: [{ role: 'user', content: buildTrainingRegenMessage(req) }],
+  });
+
+  const synthRaw = synthMsg.content[0];
+  if (synthRaw.type !== 'text') throw new Error('Unexpected response from synthesis phase');
+  const regenMeals = parseJSON(synthRaw.text) as { day: string; date: string; mealType: string; recipe: Record<string, unknown> }[];
+  return regenMeals.map((m) => ({ ...m, recipe: stampAiGenerated(m.recipe) }));
 }

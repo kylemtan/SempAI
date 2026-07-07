@@ -1,16 +1,21 @@
 import { useState, useEffect, useMemo } from 'react';
 import type { ShoppingItem } from '../../types/mealPlan';
-import { useKrogerStore } from '../../store/useKrogerStore';
+import { useKrogerStore, type ProductMatchMode } from '../../store/useKrogerStore';
 import { useMealPlanStore } from '../../store/useMealPlanStore';
 import { usePantryStore } from '../../store/usePantryStore';
+import { useProductCorrectionsStore } from '../../store/useProductCorrectionsStore';
+import { useAccessStore } from '../../store/useAccessStore';
+import FullAccessRequiredModal from './FullAccessRequiredModal';
 import {
   searchKrogerLocations,
   searchKrogerProducts,
   addToKrogerCart,
+  verifyProductMatches,
   type CartPayloadItem,
   type ProductOption,
   type ProductSearchResult,
   type KrogerLocation,
+  type ArbitrationItem,
 } from '../../services/krogerApi';
 
 interface Props {
@@ -27,11 +32,241 @@ type Phase =
   | { name: 'list' }
   | { name: 'store-picker' }
   | { name: 'searching' }
-  | { name: 'browsing'; results: ProductSearchResult[]; selections: Map<string, ProductOption>; skipped: Set<string>; index: number }
-  | { name: 'confirming'; results: ProductSearchResult[]; selections: Map<string, ProductOption>; skipped: Set<string> }
+  | { name: 'confirming'; results: ProductSearchResult[]; selections: Map<string, ProductOption>; quantities: Map<string, number>; confidence: Map<string, boolean>; notFound: Set<string>; claudeRejected: Set<string>; pickedByClaudeDirectly: boolean }
+  | { name: 'editing'; results: ProductSearchResult[]; selections: Map<string, ProductOption>; quantities: Map<string, number>; confidence: Map<string, boolean>; notFound: Set<string>; claudeRejected: Set<string>; pickedByClaudeDirectly: boolean; rowKey: string }
   | { name: 'adding' }
   | { name: 'done'; addedCount: number; addedTerms: string[] }
   | { name: 'error'; message: string };
+
+// Auto-picks a default product per ingredient. Kroger's own relevance ranking
+// isn't reliable enough to trust on its own (e.g. "mint leaves" ranking breath
+// gum highly on word overlap), so instead of just taking Kroger's top few and
+// picking cheapest, we score every candidate three ways:
+//   1. Text coverage — how many of the search term's meaningful words actually
+//      appear in the description. Requiring ALL of them (not just one) matters
+//      for multi-word ingredients: "toasted rice powder" sharing only the word
+//      "rice" with some unrelated flavored-rice product isn't a real match.
+//   2. Phrase adjacency — among candidates tied on word coverage, the words
+//      appearing together ("Thai Bird Chili") is a stronger signal than the
+//      same words scattered independently through an unrelated description.
+//   3. Department plausibility (`looksLikeIngredient`, computed server-side) —
+//      snacks/beverages/candy routinely borrow flavor names from real
+//      ingredients ("Lemongrass Sparkling Water"), so a product can win on
+//      text alone and still be the wrong *kind* of thing entirely.
+// A pick only counts as confident when it wins on all three — otherwise we
+// still pick something (better than leaving it blank) but flag it for the
+// user.
+//
+// How many of those already-gated candidates to price-compare is user-tunable
+// (see ProductMatchMode) — widening the pool never lets a worse-matching
+// candidate back in, since it only competes candidates that already passed
+// both checks above; it just decides how hard to shop among equally-valid
+// options versus trusting Kroger's own top relevance pick.
+export const MATCH_MODE_POOL_SIZES: Record<ProductMatchMode, number> = {
+  accuracy: 1,
+  balanced: 3,
+  price: 10,
+};
+
+// Words too generic to count as a meaningful match on their own — mirrors the
+// prep/part words the backend strips before searching Kroger.
+const GENERIC_SEARCH_WORDS = new Set([
+  'fresh', 'dried', 'frozen', 'canned', 'raw', 'whole', 'sliced', 'chopped',
+  'minced', 'diced', 'shredded', 'peeled', 'halved', 'quartered', 'toasted',
+  'roasted', 'sprig', 'sprigs', 'stalk', 'stalks', 'bunch', 'bunches',
+  'leaf', 'leaves', 'piece', 'pieces', 'and', 'or', 'the', 'of',
+]);
+
+// Recipe-speak vs. retail-speak naming differences — Kroger's catalog often
+// uses different words than recipes do for the exact same ingredient. Both
+// the search term and candidate descriptions are run through this before
+// matching, so "scallion" and a product literally labeled "Green Onion"
+// score as the same ingredient instead of zero overlap. Not exhaustive —
+// extend as new mismatches turn up.
+const INGREDIENT_ALIASES: [RegExp, string][] = [
+  [/\bscallions?\b/g, 'green onion'],
+  [/\bspring onions?\b/g, 'green onion'],
+  [/\bcilantro\b/g, 'coriander'],
+  [/\bgarbanzo(?:\s+beans?)?s?\b/g, 'chickpea'],
+  [/\barugula\b/g, 'rocket'],
+  [/\beggplants?\b/g, 'aubergine'],
+  [/\bzucchinis?\b/g, 'courgette'],
+  [/\bshrimps?\b/g, 'prawn'],
+  [/\bjalape[nñ]os?\b/g, 'jalapeno'],
+  [/\b(?:powdered|icing)\s+sugar\b/g, 'confectioners sugar'],
+  [/\ball-purpose flour\b/g, 'plain flour'],
+  [/\bheavy cream\b/g, 'heavy whipping cream'],
+  [/\bstring beans?\b/g, 'green bean'],
+  [/\bsnow peas?\b/g, 'mangetout'],
+  [/\bromaine\b/g, 'cos lettuce'],
+  [/\bchil(?:i|e)s?\b/g, 'chili'],
+];
+
+function normalizeIngredientAliases(text: string): string {
+  let t = text.toLowerCase();
+  for (const [pattern, canonical] of INGREDIENT_ALIASES) {
+    t = t.replace(pattern, canonical);
+  }
+  return t;
+}
+
+function coreTokens(term: string): string[] {
+  return normalizeIngredientAliases(term)
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length > 1 && !GENERIC_SEARCH_WORDS.has(w))
+    .map((w) => pantryKey(w));
+}
+
+function overlapScore(tokens: string[], description: string): number {
+  const desc = normalizeIngredientAliases(description);
+  // Allow a plain plural suffix on the description side — tokens are already
+  // singularized, but descriptions ("Onions", "Chilies") usually aren't.
+  return tokens.filter((t) => new RegExp(`\\b${t}(?:e?s)?\\b`).test(desc)).length;
+}
+
+// Bag-of-words overlap alone can't tell "Thai Bird Chili" appearing together
+// from the same three words scattered across an unrelated description. Only
+// meaningful for multi-word searches — a single token has no order to check.
+// Allows a short gap (punctuation, "'s", a filler word) between consecutive
+// words so reasonable formatting differences don't defeat it, without
+// allowing the words to be scattered arbitrarily far apart.
+function phraseMatch(tokens: string[], description: string): boolean {
+  if (tokens.length < 2) return true;
+  const desc = normalizeIngredientAliases(description);
+  const pattern = tokens.map((t) => `${t}(?:e?s)?`).join('[^a-z0-9]{0,15}');
+  return new RegExp(`\\b${pattern}\\b`).test(desc);
+}
+
+// Normalizing through the same alias table used for scoring means a
+// correction remembered for "scallion" is still found next time the recipe
+// happens to say "green onion" instead.
+function correctionKey(searchTerm: string): string {
+  return normalizeIngredientAliases(searchTerm).trim();
+}
+
+export interface AutoSelection {
+  option: ProductOption;
+  confident: boolean;
+}
+
+function autoSelectProduct(options: ProductOption[], searchTerm: string, poolSize: number): AutoSelection | null {
+  if (options.length === 0) return null;
+
+  const key = correctionKey(searchTerm);
+  const store = useProductCorrectionsStore.getState();
+
+  // A remembered manual correction always wins, as long as the same product
+  // still shows up among this search's results.
+  const remembered = store.corrections[key];
+  if (remembered) {
+    const match = options.find((o) => o.productId === remembered);
+    if (match) return { option: match, confident: true };
+  }
+
+  // Products explicitly rejected for this ingredient before should never be
+  // auto-picked again.
+  const excluded = store.exclusions[key];
+  const eligible = excluded?.length ? options.filter((o) => !excluded.includes(o.productId)) : options;
+  if (eligible.length === 0) return null;
+
+  const inStock = eligible.filter((o) => o.stockLevel !== 'TEMPORARILY_OUT_OF_STOCK');
+  const candidates = inStock.length > 0 ? inStock : eligible;
+
+  const tokens = coreTokens(searchTerm);
+  const scored = candidates.map((o) => ({ o, score: tokens.length ? overlapScore(tokens, o.description) : 0 }));
+  const maxScore = Math.max(...scored.map((s) => s.score));
+
+  // Preserve Kroger's relevance order within whichever tier we use.
+  const tier = maxScore > 0 ? scored.filter((s) => s.score === maxScore) : scored;
+
+  // Among candidates tied on word overlap, further prefer ones where the
+  // words actually appear together as a phrase, not just scattered
+  // independently through the description.
+  const phrased = tier.filter((s) => phraseMatch(tokens, s.o.description));
+  const textTier = phrased.length > 0 ? phrased : tier;
+
+  // Within that, prefer candidates that actually look like a cooking
+  // ingredient before considering price — a beverage or snack sharing the
+  // ingredient's name shouldn't out-compete a real produce/spice listing
+  // just because it happens to be cheaper.
+  const plausible = textTier.filter((s) => s.o.looksLikeIngredient);
+  const pool = (plausible.length > 0 ? plausible : textTier).slice(0, poolSize).map((s) => s.o);
+
+  // Kroger's own top-ranked candidate within the valid tier — what "Accurate"
+  // mode (pool size 1) would have picked.
+  const topRelevance = pool[0];
+  const best = pool.reduce((best, o) => {
+    const price = o.promoPrice ?? o.regularPrice ?? Infinity;
+    const bestPrice = best.promoPrice ?? best.regularPrice ?? Infinity;
+    return price < bestPrice ? o : best;
+  }, pool[0]);
+
+  // Widening the pool (Balanced/Cheapest) only ever chooses among candidates
+  // that already passed the checks above, but swapping Kroger's own top pick
+  // for a cheaper alternative is still a real, separate source of risk — a
+  // technically-valid substitution can still be the wrong brand/size/form for
+  // what was actually needed. That risk scales with pool size (a wider net
+  // finds more substitutions), which is exactly why "Cheapest" should flag
+  // more items than "Accurate" — so it counts against confidence too, not
+  // just full text coverage and department plausibility.
+  const substitutedForPrice = best.productId !== topRelevance.productId;
+
+  const fullTextMatch = tokens.length > 0 && maxScore === tokens.length;
+  const confident = fullTextMatch && best.looksLikeIngredient && !substitutedForPrice && phraseMatch(tokens, best.description);
+
+  return { option: best, confident };
+}
+
+// ── Quantity matching ─────────────────────────────────────────────────────────
+// Units that ARE the retail package itself — a "can"/"jar"/"box" of something is
+// always one product unit, so defaulting to pack size 1 here is a safe guess
+// even without spotting an explicit multi-pack count in the product text.
+const SAFE_PACKAGE_UNITS = new Set([
+  'can', 'cans', 'jar', 'jars', 'bottle', 'bottles', 'box', 'boxes', 'package', 'packages', 'bag', 'bags',
+]);
+
+// Units that describe a piece of food, not the retail package (a recipe's
+// "6 cloves" of garlic says nothing about how many cloves are in the bulb
+// Kroger sells) — only multiply these when the product text explicitly states
+// a pack count; otherwise leave quantity at 1 rather than guess.
+const AMBIGUOUS_COUNT_UNITS = new Set([
+  '', 'whole', 'each', 'large', 'medium', 'small', 'clove', 'cloves', 'slice', 'slices',
+  'piece', 'pieces', 'stalk', 'stalks', 'sprig', 'sprigs', 'head', 'heads',
+  'fillet', 'fillets', 'ear', 'ears', 'bunch', 'bunches',
+]);
+
+function parseNeededCount(estimatedQuantity: string): { count: number; safePackageUnit: boolean } | null {
+  const trimmed = estimatedQuantity.trim();
+  if (trimmed.includes('+')) return null; // mixed units combined across recipes — too ambiguous
+  const m = trimmed.match(/^(\d+(?:\.\d+)?)\s*([a-zA-Z]*)$/);
+  if (!m) return null;
+  const unit = m[2].toLowerCase();
+  if (SAFE_PACKAGE_UNITS.has(unit)) return { count: Math.ceil(parseFloat(m[1])), safePackageUnit: true };
+  if (AMBIGUOUS_COUNT_UNITS.has(unit)) return { count: Math.ceil(parseFloat(m[1])), safePackageUnit: false };
+  return null;
+}
+
+function parsePackSize(opt: ProductOption): number | null {
+  const m = `${opt.size} ${opt.description}`.match(/(\d+)[\s-]*(?:ct\.?|count|pk\.?|pack)\b/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  return n > 0 ? n : null;
+}
+
+const MAX_AUTO_BUY_UNITS = 12;
+
+// How many of the chosen product to buy so the total covers what the recipes
+// need — e.g. need 6 onions, product is a 3-count bag → buy 2. Falls back to 1
+// (no guess) whenever the unit or package size is ambiguous, since silently
+// over-buying is worse than leaving it for the user to check.
+function computeBuyQuantity(estimatedQuantity: string, opt: ProductOption): number {
+  const need = parseNeededCount(estimatedQuantity);
+  if (!need || opt.soldBy === 'WEIGHT') return 1;
+  const packSize = parsePackSize(opt) ?? (need.safePackageUnit ? 1 : null);
+  if (packSize === null) return 1;
+  const units = Math.ceil(need.count / packSize);
+  return units > 0 && units <= MAX_AUTO_BUY_UNITS ? units : 1;
+}
 
 function krogerUrl(productId: string, description: string): string {
   const slug = description.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
@@ -41,6 +276,17 @@ function krogerUrl(productId: string, description: string): string {
 function proxyImage(url: string | null): string | null {
   if (!url) return null;
   return `/api/kroger/image?url=${encodeURIComponent(url)}`;
+}
+
+// Naive singularization so pantry items ("Onion") still match plural recipe
+// ingredient names ("onions") — pantry entries are stored singular but
+// AI-written ingredient lists are almost always plural.
+function pantryKey(name: string): string {
+  const n = name.toLowerCase().trim();
+  if (n.endsWith('ies') && n.length > 3) return n.slice(0, -3) + 'y';
+  if (n.endsWith('oes') || n.endsWith('shes') || n.endsWith('ches') || n.endsWith('xes')) return n.slice(0, -2);
+  if (n.endsWith('s') && !n.endsWith('ss')) return n.slice(0, -1);
+  return n;
 }
 
 function PriceDisplay({ regular, promo }: { regular: number | null; promo: number | null }) {
@@ -129,22 +375,23 @@ function ProductCard({
 }
 
 export default function ShoppingListModal({ items, onClose }: Props) {
-  const { isConnected, locationId, locationName, setLocation, disconnect } = useKrogerStore();
-  const { cartedTerms, addToCarted, removeFromCarted } = useMealPlanStore();
+  const { isConnected, locationId, locationName, setLocation, disconnect, matchMode, setMatchMode } = useKrogerStore();
+  const hasFullAccess = useAccessStore((s) => s.trusted);
+  const { cartedTerms, addToCarted, removeFromCarted, mealPlan } = useMealPlanStore();
   const { pantry, addToPantry, removeFromPantry } = usePantryStore();
 
   const [checked, setChecked] = useState<Set<string>>(() => {
     const carted = new Set(useMealPlanStore.getState().cartedTerms);
     const pantryNames = new Set(
-      usePantryStore.getState().pantry.map((p) => p.name.toLowerCase().trim())
+      usePantryStore.getState().pantry.map((p) => pantryKey(p.name))
     );
     return new Set(
       items
         .filter((i) =>
           !carted.has(i.krogerSearchTerm) &&
-          !pantryNames.has(i.displayName.toLowerCase().trim())
+          !pantryNames.has(pantryKey(i.displayName))
         )
-        .map((i) => i.krogerSearchTerm)
+        .map((i) => i.displayName)
     );
   });
   const [sort, setSort] = useState<SortKey>('alpha-asc');
@@ -152,14 +399,20 @@ export default function ShoppingListModal({ items, onClose }: Props) {
   const [phase, setPhase] = useState<Phase>({ name: 'list' });
   const [productSort, setProductSort] = useState<ProductSortKey>('price-asc');
   const [productFilter, setProductFilter] = useState<ProductFilterKey>('all');
+  const [checkAllForVerify, setCheckAllForVerify] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+  const [verifyError, setVerifyError] = useState<string | null>(null);
+  const [claudeVerifyUsed, setClaudeVerifyUsed] = useState(false);
+  const [claudeDirectMode, setClaudeDirectMode] = useState(false);
+  const [showFullAccessModal, setShowFullAccessModal] = useState(false);
 
   // Reset product sort/filter when navigating to a different ingredient
   useEffect(() => {
-    if (phase.name === 'browsing') {
+    if (phase.name === 'editing') {
       setProductSort('price-asc');
       setProductFilter('all');
     }
-  }, [phase.name === 'browsing' ? phase.index : null]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [phase.name === 'editing' ? phase.rowKey : null]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Store picker
   const [zip, setZip] = useState('');
@@ -180,35 +433,63 @@ export default function ShoppingListModal({ items, onClose }: Props) {
     setChecked((p) => { const n = new Set(p); n.has(key) ? n.delete(key) : n.add(key); return n; });
   }
   function toggleAll() {
-    setChecked((p) => p.size === items.length ? new Set() : new Set(items.map((i) => i.krogerSearchTerm)));
+    setChecked((prev) => {
+      const next = new Set(prev);
+      for (const i of nonPantryItems) {
+        if (allNonPantryChecked) next.delete(i.displayName);
+        else next.add(i.displayName);
+      }
+      return next;
+    });
   }
 
   function moveToList(item: ShoppingItem) {
     removeFromCarted(item.krogerSearchTerm);
     removeFromPantry(item.displayName);
-    setChecked((p) => { const n = new Set(p); n.add(item.krogerSearchTerm); return n; });
+    setChecked((p) => { const n = new Set(p); n.add(item.displayName); return n; });
   }
 
   function moveToPantry(item: ShoppingItem) {
     addToPantry([{ name: item.displayName }]);
-    setChecked((p) => { const n = new Set(p); n.delete(item.krogerSearchTerm); return n; });
+    setChecked((p) => { const n = new Set(p); n.delete(item.displayName); return n; });
   }
+
+  // Recipe name → cuisine, so Claude arbitration can tell "Thai Red Chilis"
+  // apart from a generic hot chili pepper substitute instead of just seeing
+  // the bare ingredient name.
+  const recipeCuisines = useMemo(() => {
+    const map = new Map<string, string>();
+    if (!mealPlan) return map;
+    for (const day of mealPlan.mealPlan) {
+      for (const meal of day.meals) {
+        map.set(meal.recipe.name, meal.recipe.cuisine);
+      }
+    }
+    return map;
+  }, [mealPlan]);
 
   // ── Sorted + filtered list ─────────────────────────────────────────────────
 
   const pantryNames = useMemo(
-    () => new Set(pantry.map((p) => p.name.toLowerCase().trim())),
+    () => new Set(pantry.map((p) => pantryKey(p.name))),
     [pantry]
   );
 
+  const nonPantryItems = useMemo(
+    () => items.filter((i) => !pantryNames.has(pantryKey(i.displayName))),
+    [items, pantryNames]
+  );
+  const allNonPantryChecked =
+    nonPantryItems.length > 0 && nonPantryItems.every((i) => checked.has(i.displayName));
+
   const displayItems = useMemo(() => {
     let list = [...items];
-    if (filter === 'selected')   list = list.filter((i) => checked.has(i.krogerSearchTerm));
-    if (filter === 'unselected') list = list.filter((i) => !checked.has(i.krogerSearchTerm));
+    if (filter === 'selected')   list = list.filter((i) => checked.has(i.displayName));
+    if (filter === 'unselected') list = list.filter((i) => !checked.has(i.displayName));
     list.sort((a, b) => {
       const tier = (i: ShoppingItem) => {
         if (cartedTerms.includes(i.krogerSearchTerm)) return 1;
-        if (pantryNames.has(i.displayName.toLowerCase().trim())) return 2;
+        if (pantryNames.has(pantryKey(i.displayName))) return 2;
         return 0;
       };
       const ta = tier(a), tb = tier(b);
@@ -225,7 +506,7 @@ export default function ShoppingListModal({ items, onClose }: Props) {
   const cartedSet = new Set(cartedTerms);
 
   const cartPayload: CartPayloadItem[] = items
-    .filter((i) => checked.has(i.krogerSearchTerm))
+    .filter((i) => checked.has(i.displayName))
     .map((i) => ({ krogerSearchTerm: i.krogerSearchTerm, displayName: i.displayName }));
 
   // ── Store picker ───────────────────────────────────────────────────────────
@@ -253,15 +534,242 @@ export default function ShoppingListModal({ items, onClose }: Props) {
   async function handleFindProducts() {
     if (!locationId || !cartPayload.length) return;
     setPhase({ name: 'searching' });
+    setClaudeVerifyUsed(false);
+    setVerifyError(null);
     try {
       const results = await searchKrogerProducts(cartPayload, locationId);
-      const selections = new Map<string, ProductOption>();
-      for (const r of results) {
-        if (r.options.length > 0) selections.set(r.krogerSearchTerm, r.options[0]);
+
+      // Defense in depth — the checkbox is hidden without Full Access, but
+      // don't trust stale client state (e.g. access lapsed mid-session) over
+      // what the backend will actually enforce anyway.
+      if (claudeDirectMode && hasFullAccess) {
+        await resolveWithClaudeDirectly(results);
+        return;
       }
-      setPhase({ name: 'browsing', results, selections, skipped: new Set(), index: 0 });
+
+      runAlgorithmOnResults(results);
     } catch (err) {
       setPhase({ name: 'error', message: err instanceof Error ? err.message : 'Search failed' });
+    }
+  }
+
+  // Keyed by displayName, not krogerSearchTerm — two different shopping-list
+  // rows (e.g. "Toasted Sesame Seeds" and "Sesame Seeds") can share the same
+  // krogerSearchTerm, which would silently collapse their entries together.
+  // `fallbackNotice`, when set, means this ran because Claude-direct mode
+  // failed (e.g. rate limited) — surfaced as a visible notice rather than
+  // silently substituting the algorithm's picks without saying so.
+  function runAlgorithmOnResults(results: ProductSearchResult[], fallbackNotice?: string) {
+    const selections = new Map<string, ProductOption>();
+    const quantities = new Map<string, number>();
+    const confidence = new Map<string, boolean>();
+    const notFound = new Set<string>();
+    for (const r of results) {
+      const picked = autoSelectProduct(r.options, r.krogerSearchTerm, MATCH_MODE_POOL_SIZES[matchMode]);
+      if (picked) {
+        selections.set(r.displayName, picked.option);
+        confidence.set(r.displayName, picked.confident);
+        const shoppingItem = items.find((i) => i.displayName === r.displayName);
+        quantities.set(r.displayName, shoppingItem ? computeBuyQuantity(shoppingItem.estimatedQuantity, picked.option) : 1);
+      } else {
+        notFound.add(r.displayName);
+      }
+    }
+    setPhase({ name: 'confirming', results, selections, quantities, confidence, notFound, claudeRejected: new Set(), pickedByClaudeDirectly: false });
+    if (fallbackNotice) {
+      setVerifyError(`Claude product matching failed (${fallbackNotice}) — showing algorithm-based matches instead.`);
+    }
+  }
+
+  // Claude picks every ingredient directly instead of the token/department
+  // algorithm. Remembered corrections and exclusions still take precedence —
+  // a prior manual decision shouldn't be re-litigated by Claude every time —
+  // so only the remaining rows actually go into the batched request.
+  async function resolveWithClaudeDirectly(results: ProductSearchResult[]) {
+    const selections = new Map<string, ProductOption>();
+    const quantities = new Map<string, number>();
+    const confidence = new Map<string, boolean>();
+    const notFound = new Set<string>();
+    const claudeRejected = new Set<string>();
+
+    const store = useProductCorrectionsStore.getState();
+    const requestItems: ArbitrationItem[] = [];
+
+    for (const r of results) {
+      if (r.options.length === 0) { notFound.add(r.displayName); continue; }
+
+      const key = correctionKey(r.krogerSearchTerm);
+      const shoppingItem = items.find((i) => i.displayName === r.displayName);
+
+      const remembered = store.corrections[key];
+      const rememberedMatch = remembered ? r.options.find((o) => o.productId === remembered) : undefined;
+      if (rememberedMatch) {
+        selections.set(r.displayName, rememberedMatch);
+        confidence.set(r.displayName, true);
+        quantities.set(r.displayName, shoppingItem ? computeBuyQuantity(shoppingItem.estimatedQuantity, rememberedMatch) : 1);
+        continue;
+      }
+
+      const excluded = store.exclusions[key];
+      const eligible = excluded?.length ? r.options.filter((o) => !excluded.includes(o.productId)) : r.options;
+      if (eligible.length === 0) { notFound.add(r.displayName); continue; }
+
+      const inStock = eligible.filter((o) => o.stockLevel !== 'TEMPORARILY_OUT_OF_STOCK');
+      const pool = (inStock.length > 0 ? inStock : eligible).slice(0, 8);
+
+      const usedIn = shoppingItem?.usedIn ?? [];
+      const cuisines = [...new Set(usedIn.map((name) => recipeCuisines.get(name)).filter((c): c is string => !!c))];
+      const recipeContext = usedIn.length
+        ? `Used in: ${usedIn.join(', ')}${cuisines.length ? ` (${cuisines.join('/')} cuisine)` : ''}`
+        : undefined;
+
+      requestItems.push({
+        key: r.displayName,
+        ingredientName: r.displayName,
+        searchTerm: r.krogerSearchTerm,
+        neededQuantity: shoppingItem?.estimatedQuantity ?? '',
+        recipeContext,
+        candidates: pool.map((o) => ({
+          productId: o.productId,
+          brand: o.brand,
+          description: o.description,
+          size: o.size,
+          regularPrice: o.regularPrice,
+          promoPrice: o.promoPrice,
+          stockLevel: o.stockLevel,
+        })),
+      });
+    }
+
+    try {
+      if (requestItems.length > 0) {
+        const claudeResults = await verifyProductMatches(requestItems);
+        const handledKeys = new Set<string>();
+
+        for (const result of claudeResults) {
+          handledKeys.add(result.key);
+          const resultRow = results.find((r) => r.displayName === result.key);
+          if (!resultRow) continue;
+
+          const opt = result.productId ? resultRow.options.find((o) => o.productId === result.productId) : undefined;
+          if (opt) {
+            selections.set(result.key, opt);
+            confidence.set(result.key, result.confident ?? true);
+            const shoppingItem = items.find((i) => i.displayName === result.key);
+            quantities.set(result.key, shoppingItem ? computeBuyQuantity(shoppingItem.estimatedQuantity, opt) : 1);
+          } else {
+            claudeRejected.add(result.key);
+          }
+        }
+
+        // Defensive: if Claude's response ever omits a requested item, don't
+        // silently leave it looking untouched — flag it the same as a no-match.
+        for (const item of requestItems) {
+          if (!handledKeys.has(item.key)) claudeRejected.add(item.key);
+        }
+      }
+
+      setPhase({ name: 'confirming', results, selections, quantities, confidence, notFound, claudeRejected, pickedByClaudeDirectly: true });
+    } catch (err) {
+      // Claude failed (rate limited, network error, etc.) — don't strand the
+      // user with nothing; fall back to the algorithm on the same
+      // already-fetched results (autoSelectProduct re-applies corrections/
+      // exclusions on its own, so nothing from the attempt above is lost).
+      runAlgorithmOnResults(results, err instanceof Error ? err.message : 'unknown error');
+    }
+  }
+
+  // ── Ask Claude to arbitrate uncertain matches ──────────────────────────────
+
+  function rowsEligibleForVerify(): ProductSearchResult[] {
+    if (phase.name !== 'confirming') return [];
+    return phase.results.filter((r) => {
+      if (r.options.length === 0) return false; // nothing for Claude to choose from
+      if (checkAllForVerify) return true;
+      const sel = phase.selections.get(r.displayName);
+      const confident = phase.confidence.get(r.displayName);
+      return !sel || confident === false;
+    });
+  }
+
+  async function handleAskClaude() {
+    if (phase.name !== 'confirming' || !hasFullAccess) return;
+    const eligible = rowsEligibleForVerify();
+    if (eligible.length === 0) return;
+
+    setVerifying(true);
+    setVerifyError(null);
+    try {
+      const requestItems: ArbitrationItem[] = eligible.map((r) => {
+        const shoppingItem = items.find((i) => i.displayName === r.displayName);
+        // Same in-stock preference used elsewhere, capped for token cost —
+        // the backend caps again regardless, this just keeps the request small.
+        const inStock = r.options.filter((o) => o.stockLevel !== 'TEMPORARILY_OUT_OF_STOCK');
+        const pool = (inStock.length > 0 ? inStock : r.options).slice(0, 8);
+
+        const usedIn = shoppingItem?.usedIn ?? [];
+        const cuisines = [...new Set(usedIn.map((name) => recipeCuisines.get(name)).filter((c): c is string => !!c))];
+        const recipeContext = usedIn.length
+          ? `Used in: ${usedIn.join(', ')}${cuisines.length ? ` (${cuisines.join('/')} cuisine)` : ''}`
+          : undefined;
+
+        return {
+          key: r.displayName,
+          ingredientName: r.displayName,
+          searchTerm: r.krogerSearchTerm,
+          neededQuantity: shoppingItem?.estimatedQuantity ?? '',
+          recipeContext,
+          candidates: pool.map((o) => ({
+            productId: o.productId,
+            brand: o.brand,
+            description: o.description,
+            size: o.size,
+            regularPrice: o.regularPrice,
+            promoPrice: o.promoPrice,
+            stockLevel: o.stockLevel,
+          })),
+        };
+      });
+
+      const results = await verifyProductMatches(requestItems);
+
+      setPhase((prev) => {
+        if (prev.name !== 'confirming') return prev;
+        const nextSel = new Map(prev.selections);
+        const nextQty = new Map(prev.quantities);
+        const nextConf = new Map(prev.confidence);
+        const nextRejected = new Set(prev.claudeRejected);
+
+        for (const result of results) {
+          const resultRow = prev.results.find((r) => r.displayName === result.key);
+          if (!resultRow) continue;
+
+          if (result.productId) {
+            const opt = resultRow.options.find((o) => o.productId === result.productId);
+            if (opt) {
+              nextSel.set(result.key, opt);
+              nextConf.set(result.key, result.confident ?? true);
+              const shoppingItem = items.find((i) => i.displayName === result.key);
+              nextQty.set(result.key, shoppingItem ? computeBuyQuantity(shoppingItem.estimatedQuantity, opt) : 1);
+              nextRejected.delete(result.key);
+            }
+          } else {
+            nextSel.delete(result.key);
+            nextQty.delete(result.key);
+            nextConf.delete(result.key);
+            nextRejected.add(result.key);
+          }
+        }
+
+        return { ...prev, selections: nextSel, quantities: nextQty, confidence: nextConf, claudeRejected: nextRejected };
+      });
+      // Only lock the button out on success — a failed attempt (rate limit,
+      // network error) should stay retryable.
+      setClaudeVerifyUsed(true);
+    } catch (err) {
+      setVerifyError(err instanceof Error ? err.message : 'Verification failed');
+    } finally {
+      setVerifying(false);
     }
   }
 
@@ -281,56 +789,90 @@ export default function ShoppingListModal({ items, onClose }: Props) {
     return list;
   }
 
-  // ── Browsing navigation ────────────────────────────────────────────────────
+  // ── Editing a single item's product choice ────────────────────────────────
 
-  function browsingSelect(key: string, opt: ProductOption) {
-    if (phase.name !== 'browsing') return;
-    const next = new Map(phase.selections);
-    next.get(key)?.productId === opt.productId ? next.delete(key) : next.set(key, opt);
-    setPhase({ ...phase, selections: next });
+  function openEditing(rowKey: string) {
+    if (phase.name !== 'confirming') return;
+    setPhase({ name: 'editing', results: phase.results, selections: phase.selections, quantities: phase.quantities, confidence: phase.confidence, notFound: phase.notFound, claudeRejected: phase.claudeRejected, pickedByClaudeDirectly: phase.pickedByClaudeDirectly, rowKey });
   }
 
-  function browsingAdvance(skip = false) {
-    if (phase.name !== 'browsing') return;
-    const { results, selections, skipped, index } = phase;
-    const current = results[index];
-    const newSkipped = new Set(skipped);
-    const newSelections = new Map(selections);
-    if (skip) {
-      newSkipped.add(current.krogerSearchTerm);
-      newSelections.delete(current.krogerSearchTerm);
-    }
-    const nextIndex = index + 1;
-    if (nextIndex >= results.length) {
-      setPhase({ name: 'confirming', results, selections: newSelections, skipped: newSkipped });
+  function editSelect(opt: ProductOption) {
+    if (phase.name !== 'editing') return;
+    const nextSel = new Map(phase.selections);
+    const nextQty = new Map(phase.quantities);
+    const nextConf = new Map(phase.confidence);
+    if (nextSel.get(phase.rowKey)?.productId === opt.productId) {
+      nextSel.delete(phase.rowKey);
+      nextQty.delete(phase.rowKey);
+      nextConf.delete(phase.rowKey);
+      // Explicitly rejecting a product for this ingredient means it
+      // shouldn't be auto-picked for it again.
+      const result = phase.results.find((r) => r.displayName === phase.rowKey);
+      if (result) {
+        useProductCorrectionsStore.getState().exclude(correctionKey(result.krogerSearchTerm), opt.productId);
+      }
     } else {
-      setPhase({ ...phase, selections: newSelections, skipped: newSkipped, index: nextIndex });
+      nextSel.set(phase.rowKey, opt);
+      // A human just picked this deliberately — treat it as reviewed regardless
+      // of what the word-overlap score would have said.
+      nextConf.set(phase.rowKey, true);
+      const shoppingItem = items.find((i) => i.displayName === phase.rowKey);
+      nextQty.set(phase.rowKey, shoppingItem ? computeBuyQuantity(shoppingItem.estimatedQuantity, opt) : 1);
+
+      // Remember this choice so future shopping lists auto-pick it directly.
+      const result = phase.results.find((r) => r.displayName === phase.rowKey);
+      if (result) {
+        useProductCorrectionsStore.getState().remember(correctionKey(result.krogerSearchTerm), opt.productId);
+      }
     }
+    // A manual pick resolves any earlier "Claude found no match" verdict.
+    const nextRejected = new Set(phase.claudeRejected);
+    nextRejected.delete(phase.rowKey);
+    setPhase({ ...phase, selections: nextSel, quantities: nextQty, confidence: nextConf, claudeRejected: nextRejected });
   }
 
-  function browsingBack() {
-    if (phase.name !== 'browsing' || phase.index === 0) return;
-    setPhase({ ...phase, index: phase.index - 1 });
+  function removeEditingSelection() {
+    if (phase.name !== 'editing') return;
+    const nextSel = new Map(phase.selections);
+    const nextQty = new Map(phase.quantities);
+    const nextConf = new Map(phase.confidence);
+    const removed = nextSel.get(phase.rowKey);
+    nextSel.delete(phase.rowKey);
+    nextQty.delete(phase.rowKey);
+    nextConf.delete(phase.rowKey);
+    if (removed) {
+      const result = phase.results.find((r) => r.displayName === phase.rowKey);
+      if (result) {
+        useProductCorrectionsStore.getState().exclude(correctionKey(result.krogerSearchTerm), removed.productId);
+      }
+    }
+    setPhase({ ...phase, selections: nextSel, quantities: nextQty, confidence: nextConf });
+  }
+
+  function closeEditing() {
+    if (phase.name !== 'editing') return;
+    setPhase({ name: 'confirming', results: phase.results, selections: phase.selections, quantities: phase.quantities, confidence: phase.confidence, notFound: phase.notFound, claudeRejected: phase.claudeRejected, pickedByClaudeDirectly: phase.pickedByClaudeDirectly });
   }
 
   // ── Cart add ───────────────────────────────────────────────────────────────
 
   async function handleAddToCart() {
     if (phase.name !== 'confirming') return;
-    const toAdd = Array.from(phase.selections.values()).map((opt) => ({
-      productId: opt.productId,
-      displayName: opt.description,
-    }));
-    const addedTerms = Array.from(phase.selections.keys());
+    const selectedRows = phase.results.filter((r) => phase.selections.has(r.displayName));
+    const toAdd = selectedRows.map((r) => {
+      const opt = phase.selections.get(r.displayName)!;
+      const quantity = phase.quantities.get(r.displayName) ?? 1;
+      return { productId: opt.productId, displayName: opt.description, quantity };
+    });
+    // krogerSearchTerm is deduped here since "already carted" tracking is
+    // legitimately shared across rows that shop for the same product.
+    const addedKrogerTerms = [...new Set(selectedRows.map((r) => r.krogerSearchTerm))];
     setPhase({ name: 'adding' });
     try {
       const result = await addToKrogerCart(toAdd);
-      addToCarted(addedTerms);
-      const addedDisplayNames = items
-        .filter((i) => addedTerms.includes(i.krogerSearchTerm))
-        .map((i) => ({ name: i.displayName }));
-      addToPantry(addedDisplayNames);
-      setPhase({ name: 'done', addedCount: result.added.length, addedTerms });
+      addToCarted(addedKrogerTerms);
+      addToPantry(selectedRows.map((r) => ({ name: r.displayName })));
+      setPhase({ name: 'done', addedCount: result.added.length, addedTerms: addedKrogerTerms });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to add to cart';
       if (message.includes('Not connected') || message.includes('session expired')) disconnect();
@@ -343,13 +885,15 @@ export default function ShoppingListModal({ items, onClose }: Props) {
   let headerTitle = 'Shopping List';
   let headerSub = `${items.length} items · ${checked.size} selected`;
 
-  if (phase.name === 'browsing') {
-    const cur = phase.results[phase.index];
-    headerTitle = cur.displayName;
-    headerSub = `${phase.index + 1} of ${phase.results.length} ingredients · ${cur.options.length} ${cur.options.length === 1 ? 'result' : 'results'}`;
+  if (phase.name === 'editing') {
+    const cur = phase.results.find((r) => r.displayName === phase.rowKey);
+    headerTitle = cur?.displayName ?? 'Choose product';
+    headerSub = cur ? `${cur.options.length} ${cur.options.length === 1 ? 'result' : 'results'}` : '';
   } else if (phase.name === 'confirming') {
+    const unconfirmedCount = [...phase.confidence.values()].filter((c) => !c).length;
     headerTitle = 'Review Cart';
-    headerSub = `${phase.selections.size} items selected · ${phase.skipped.size} skipped`;
+    headerSub = `${phase.selections.size} selected · ${phase.notFound.size} not found`
+      + (unconfirmedCount > 0 ? ` · ${unconfirmedCount} to verify` : '');
   } else if (phase.name === 'store-picker') {
     headerSub = 'Choose your Kroger store';
   } else if (phase.name === 'done') {
@@ -371,16 +915,6 @@ export default function ShoppingListModal({ items, onClose }: Props) {
           <button className="modal__close" onClick={onClose} aria-label="Close">✕</button>
         </div>
 
-        {/* Progress bar for browsing */}
-        {phase.name === 'browsing' && (
-          <div className="browsing-progress">
-            <div
-              className="browsing-progress__fill"
-              style={{ width: `${((phase.index + 1) / phase.results.length) * 100}%` }}
-            />
-          </div>
-        )}
-
         {/* Body */}
         <div className="shopping-modal__body">
 
@@ -388,8 +922,8 @@ export default function ShoppingListModal({ items, onClose }: Props) {
           {(phase.name === 'list' || phase.name === 'searching') && (
             <>
               <div className="shopping-modal__controls">
-                <button className="shopping-list__toggle-all" onClick={toggleAll}>
-                  {checked.size === items.length ? 'Deselect all' : 'Select all'}
+                <button className="shopping-list__toggle-all" onClick={toggleAll} disabled={nonPantryItems.length === 0}>
+                  {allNonPantryChecked ? 'Deselect all' : 'Select all'}
                 </button>
                 <div className="shopping-modal__selects">
                   <label className="shopping-modal__select-label">
@@ -413,28 +947,28 @@ export default function ShoppingListModal({ items, onClose }: Props) {
               </div>
               <ul className="shopping-modal__list">
                 {displayItems.map((item, idx) => {
-                  const isChecked = checked.has(item.krogerSearchTerm);
+                  const isChecked = checked.has(item.displayName);
                   const isCarted = cartedSet.has(item.krogerSearchTerm);
-                  const isPantry = !isCarted && pantryNames.has(item.displayName.toLowerCase().trim());
+                  const isPantry = !isCarted && pantryNames.has(pantryKey(item.displayName));
                   const prev = idx > 0 ? displayItems[idx - 1] : null;
                   const prevCarted = prev ? cartedSet.has(prev.krogerSearchTerm) : false;
-                  const prevPantry = prev ? (!cartedSet.has(prev.krogerSearchTerm) && pantryNames.has(prev.displayName.toLowerCase().trim())) : false;
+                  const prevPantry = prev ? (!cartedSet.has(prev.krogerSearchTerm) && pantryNames.has(pantryKey(prev.displayName))) : false;
                   return (
                     <>
                       {isCarted && !prevCarted && (
-                        <li key={`${item.krogerSearchTerm}__cart-divider`} className="shopping-item__section-divider">
+                        <li key={`${item.displayName}__cart-divider`} className="shopping-item__section-divider">
                           In Cart
                         </li>
                       )}
                       {isPantry && !prevPantry && (
-                        <li key={`${item.krogerSearchTerm}__pantry-divider`} className="shopping-item__section-divider shopping-item__section-divider--pantry">
+                        <li key={`${item.displayName}__pantry-divider`} className="shopping-item__section-divider shopping-item__section-divider--pantry">
                           In Pantry
                         </li>
                       )}
                       <li
-                        key={item.krogerSearchTerm}
+                        key={item.displayName}
                         className={`shopping-item${!isChecked ? ' shopping-item--unchecked' : ''}`}
-                        onClick={() => toggle(item.krogerSearchTerm)}
+                        onClick={() => toggle(item.displayName)}
                       >
                         <span className="shopping-item__checkbox">{isChecked ? '✓' : ''}</span>
                         <span className="shopping-item__name">{item.displayName}</span>
@@ -502,17 +1036,21 @@ export default function ShoppingListModal({ items, onClose }: Props) {
             </div>
           )}
 
-          {/* ── Browsing ── */}
-          {phase.name === 'browsing' && (() => {
-            const cur = phase.results[phase.index];
-            const selectedOpt = phase.selections.get(cur.krogerSearchTerm);
-            const shoppingItem = items.find((i) => i.krogerSearchTerm === cur.krogerSearchTerm);
+          {/* ── Editing ── */}
+          {phase.name === 'editing' && (() => {
+            const cur = phase.results.find((r) => r.displayName === phase.rowKey);
+            if (!cur) return null;
+            const selectedOpt = phase.selections.get(cur.displayName);
+            const shoppingItem = items.find((i) => i.displayName === cur.displayName);
             return (
               <div className="product-browser">
                 {shoppingItem && (
                   <div className="product-browser__meta">
                     {shoppingItem.estimatedQuantity && (
                       <span className="product-browser__qty">Need: {shoppingItem.estimatedQuantity}</span>
+                    )}
+                    {selectedOpt && (phase.quantities.get(cur.displayName) ?? 1) > 1 && (
+                      <span className="product-browser__qty">Buying: ×{phase.quantities.get(cur.displayName)}</span>
                     )}
                     {shoppingItem.usedIn.length > 0 && (
                       <span className="product-browser__used-in">
@@ -567,7 +1105,7 @@ export default function ShoppingListModal({ items, onClose }: Props) {
                               key={opt.productId}
                               opt={opt}
                               selected={selectedOpt?.productId === opt.productId}
-                              onToggle={() => browsingSelect(cur.krogerSearchTerm, opt)}
+                              onToggle={() => editSelect(opt)}
                             />
                           ))}
                         </div>
@@ -580,33 +1118,114 @@ export default function ShoppingListModal({ items, onClose }: Props) {
           })()}
 
           {/* ── Confirming ── */}
-          {phase.name === 'confirming' && (
+          {phase.name === 'confirming' && (() => {
+            const eligibleCount = rowsEligibleForVerify().length;
+            return (
             <div className="shopping-modal__confirming">
+              {!phase.pickedByClaudeDirectly && (
+                <div className={`claude-verify-bar${claudeVerifyUsed ? ' claude-verify-bar--used' : ''}`}>
+                  <label className="claude-verify-bar__toggle">
+                    <input
+                      type="checkbox"
+                      checked={checkAllForVerify}
+                      disabled={claudeVerifyUsed}
+                      onClick={(e) => {
+                        if (!hasFullAccess) e.preventDefault();
+                      }}
+                      onChange={(e) => {
+                        if (hasFullAccess) setCheckAllForVerify(e.target.checked);
+                      }}
+                    />
+                    Check all items, not just flagged
+                  </label>
+                  <button
+                    className="btn-secondary claude-verify-bar__btn"
+                    onClick={() => {
+                      if (!hasFullAccess) { setShowFullAccessModal(true); return; }
+                      handleAskClaude();
+                    }}
+                    disabled={hasFullAccess && (verifying || eligibleCount === 0 || claudeVerifyUsed)}
+                    title={
+                      !hasFullAccess
+                        ? 'Requires Full Access — click to learn more'
+                        : claudeVerifyUsed
+                          ? 'Already verified for this search — run "Find Products" again to ask again'
+                          : 'Sends the ingredient and its candidate products to Claude to pick the best match, or say none are suitable'
+                    }
+                  >
+                    {!hasFullAccess
+                      ? `Ask Claude to Verify 🔒`
+                      : verifying
+                        ? 'Asking Claude…'
+                        : claudeVerifyUsed
+                          ? 'Verified with Claude ✓'
+                          : `Ask Claude to Verify (${eligibleCount})`}
+                  </button>
+                </div>
+              )}
+              {verifyError && <p className="claude-verify-bar__error">{verifyError}</p>}
               <ul className="confirming-list">
-                {phase.results.map((r) => {
-                  const sel = phase.selections.get(r.krogerSearchTerm);
-                  const skip = phase.skipped.has(r.krogerSearchTerm);
+                {[...phase.results]
+                  .sort((a, b) => {
+                    const unconfirmed = (r: ProductSearchResult) =>
+                      phase.selections.has(r.displayName) && phase.confidence.get(r.displayName) === false;
+                    return Number(unconfirmed(b)) - Number(unconfirmed(a));
+                  })
+                  .map((r) => {
+                  const sel = phase.selections.get(r.displayName);
+                  const qty = phase.quantities.get(r.displayName) ?? 1;
+                  const zeroResults = r.options.length === 0;
+                  const claudeRejected = phase.claudeRejected.has(r.displayName);
+                  const unconfirmed = !!sel && phase.confidence.get(r.displayName) === false;
                   return (
-                    <li key={r.krogerSearchTerm} className={`confirming-item${!sel || skip ? ' confirming-item--skipped' : ''}`}>
-                      <span className="confirming-item__ingredient">{r.displayName}</span>
-                      {sel && !skip ? (
+                    <li
+                      key={r.displayName}
+                      className={`confirming-item${!sel ? ' confirming-item--skipped' : ''}${!zeroResults ? ' confirming-item--clickable' : ''}`}
+                      onClick={zeroResults ? undefined : () => openEditing(r.displayName)}
+                    >
+                      <span className="confirming-item__ingredient">
+                        {r.displayName}
+                        {unconfirmed && (
+                          <span className="confirming-item__badge" title="Either no full word match was found, or a cheaper alternative was picked over Kroger's top match for this ingredient — worth a quick check">
+                            ⚠ Verify
+                          </span>
+                        )}
+                      </span>
+                      {sel ? (
                         <span className="confirming-item__product">
                           {sel.brand && <>{sel.brand} · </>}{sel.description}
+                          {qty > 1 && <> · ×{qty}</>}
                           {(sel.promoPrice ?? sel.regularPrice) != null && (
-                            <> · ${(sel.promoPrice ?? sel.regularPrice)!.toFixed(2)}</>
+                            <> · ${((sel.promoPrice ?? sel.regularPrice)! * qty).toFixed(2)}</>
                           )}
                         </span>
-                      ) : r.options.length === 0 ? (
-                        <span className="confirming-item__note">Not available at store</span>
+                      ) : zeroResults ? (
+                        <span className="confirming-item__note">Not found at this store</span>
+                      ) : claudeRejected ? (
+                        <span className="confirming-item__note">Claude found no suitable match</span>
                       ) : (
-                        <span className="confirming-item__note">Skipped</span>
+                        <span className="confirming-item__note">Not selected</span>
+                      )}
+                      {zeroResults ? (
+                        <a
+                          className="confirming-item__change"
+                          href={`https://www.kroger.com/search?query=${encodeURIComponent(r.displayName)}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          Search Kroger ↗
+                        </a>
+                      ) : (
+                        <span className="confirming-item__change">Change</span>
                       )}
                     </li>
                   );
                 })}
               </ul>
             </div>
-          )}
+            );
+          })()}
 
           {/* ── Done / Error ── */}
           {(phase.name === 'done' || phase.name === 'error' || phase.name === 'adding') && (
@@ -650,9 +1269,78 @@ export default function ShoppingListModal({ items, onClose }: Props) {
               <button className="btn-primary" onClick={() => setPhase({ name: 'store-picker' })}>Choose Store</button>
             )}
             {phase.name === 'list' && isConnected && locationId && (
-              <button className="btn-primary" onClick={handleFindProducts} disabled={!cartPayload.length}>
-                Find Products ({cartPayload.length})
-              </button>
+              <>
+                <label
+                  className={`claude-direct-toggle${!hasFullAccess ? ' claude-direct-toggle--locked' : ''}`}
+                  title={
+                    hasFullAccess
+                      ? 'Skip the matching algorithm entirely — send every ingredient straight to Claude to pick a product for, or say no suitable match exists.'
+                      : 'Requires Full Access — click to learn more'
+                  }
+                >
+                  <input
+                    type="checkbox"
+                    checked={claudeDirectMode}
+                    onClick={(e) => {
+                      if (!hasFullAccess) {
+                        e.preventDefault();
+                        setShowFullAccessModal(true);
+                      }
+                    }}
+                    onChange={(e) => {
+                      if (hasFullAccess) setClaudeDirectMode(e.target.checked);
+                    }}
+                  />
+                  Let Claude pick directly{!hasFullAccess && ' 🔒'}
+                </label>
+                <div
+                  className="mode-toggle mode-toggle--compact"
+                  role="radiogroup"
+                  aria-label="Product match preference"
+                  title={
+                    claudeDirectMode
+                      ? 'Not used when Claude picks directly'
+                      : "How to pick among products that already match the ingredient — trust Kroger's top result, or shop across more of them for a lower price"
+                  }
+                >
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={matchMode === 'accuracy'}
+                    className={`mode-toggle__option${matchMode === 'accuracy' ? ' mode-toggle__option--active' : ''}`}
+                    onClick={() => setMatchMode('accuracy')}
+                    disabled={claudeDirectMode}
+                    title="Use Kroger's single best match for each ingredient — no price comparison."
+                  >
+                    Accurate
+                  </button>
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={matchMode === 'balanced'}
+                    className={`mode-toggle__option${matchMode === 'balanced' ? ' mode-toggle__option--active' : ''}`}
+                    onClick={() => setMatchMode('balanced')}
+                    disabled={claudeDirectMode}
+                    title="Compare price across a few of the best matches for each ingredient (default)."
+                  >
+                    Balanced
+                  </button>
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={matchMode === 'price'}
+                    className={`mode-toggle__option${matchMode === 'price' ? ' mode-toggle__option--active' : ''}`}
+                    onClick={() => setMatchMode('price')}
+                    disabled={claudeDirectMode}
+                    title="Compare price across many matches to find the lowest price for each ingredient."
+                  >
+                    Cheapest
+                  </button>
+                </div>
+                <button className="btn-primary" onClick={handleFindProducts} disabled={!cartPayload.length}>
+                  {claudeDirectMode ? `Find Products with Claude (${cartPayload.length})` : `Find Products (${cartPayload.length})`}
+                </button>
+              </>
             )}
 
             {/* Searching */}
@@ -668,43 +1356,27 @@ export default function ShoppingListModal({ items, onClose }: Props) {
               <button className="btn-secondary" onClick={() => setPhase({ name: 'list' })}>Cancel</button>
             )}
 
-            {/* Browsing */}
-            {phase.name === 'browsing' && (() => {
-              const cur = phase.results[phase.index];
-              const sel = phase.selections.get(cur.krogerSearchTerm);
-              const isLast = phase.index === phase.results.length - 1;
-              return (
-                <>
-                  <button
-                    className="btn-secondary"
-                    onClick={() => browsingAdvance(true)}
-                  >
-                    Skip
-                  </button>
-                  <button
-                    className="btn-secondary"
-                    onClick={browsingBack}
-                    disabled={phase.index === 0}
-                  >
-                    ← Prev
-                  </button>
-                  <button className="btn-primary" onClick={() => browsingAdvance(false)}>
-                    {isLast ? 'Review →' : sel ? 'Confirm & Next →' : 'Next →'}
-                  </button>
-                </>
-              );
-            })()}
+            {/* Editing */}
+            {phase.name === 'editing' && (
+              <>
+                <button
+                  className="btn-secondary"
+                  onClick={removeEditingSelection}
+                  disabled={!phase.selections.has(phase.rowKey)}
+                >
+                  Remove Selection
+                </button>
+                <button className="btn-primary" onClick={closeEditing}>
+                  Done
+                </button>
+              </>
+            )}
 
             {/* Confirming */}
             {phase.name === 'confirming' && (
               <>
-                <button className="btn-secondary" onClick={() => {
-                  // Return to browsing at last item so they can revise
-                  if (phase.results.length > 0) {
-                    setPhase({ name: 'browsing', results: phase.results, selections: phase.selections, skipped: phase.skipped, index: phase.results.length - 1 });
-                  }
-                }}>
-                  ← Back
+                <button className="btn-secondary" onClick={() => setPhase({ name: 'list' })}>
+                  ← Back to List
                 </button>
                 <button className="btn-primary" onClick={handleAddToCart} disabled={phase.selections.size === 0}>
                   Add {phase.selections.size} to Cart
@@ -722,6 +1394,7 @@ export default function ShoppingListModal({ items, onClose }: Props) {
           </div>
         </div>
       </div>
+      {showFullAccessModal && <FullAccessRequiredModal onClose={() => setShowFullAccessModal(false)} />}
     </div>
   );
 }

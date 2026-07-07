@@ -8,8 +8,18 @@ import {
   ALLERGENS,
 } from '../store/usePreferencesStore';
 import { useMealPlanStore } from '../store/useMealPlanStore';
+import { useUsageStore } from '../store/useUsageStore';
 import CheckboxGroup from './sidebar/CheckboxGroup';
 import RangeSlider from './sidebar/RangeSlider';
+
+function timeUntil(ms: number): string {
+  const diff = Math.max(0, ms - Date.now());
+  const h = Math.floor(diff / 3_600_000);
+  const m = Math.floor((diff % 3_600_000) / 60_000);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
+  return 'less than a minute';
+}
 
 function DateRangePicker() {
   const { startDate, numDays, set } = usePreferencesStore();
@@ -72,6 +82,7 @@ interface Props {
 export default function Sidebar({ isOpen, onClose }: Props) {
   const prefs = usePreferencesStore();
   const { generate, isLoading } = useMealPlanStore();
+  const usage = useUsageStore();
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const [thumbTop, setThumbTop] = useState(0);
@@ -103,6 +114,35 @@ export default function Sidebar({ isOpen, onClose }: Props) {
       <div className="sidebar__header">
         <h1 className="sidebar__title">Preferences</h1>
         <button className="sidebar__close" aria-label="Close menu" onClick={onClose}>✕</button>
+      </div>
+
+      <div className="sidebar-section">
+        <span className="sidebar-section__label">Recipe Search</span>
+        <div className="mode-toggle" role="radiogroup" aria-label="Recipe search method">
+          <button
+            type="button"
+            role="radio"
+            aria-checked={prefs.searchMode === 'web'}
+            className={`mode-toggle__option${prefs.searchMode === 'web' ? ' mode-toggle__option--active' : ''}`}
+            onClick={() => prefs.set({ searchMode: 'web' })}
+          >
+            Web Search
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={prefs.searchMode === 'training'}
+            className={`mode-toggle__option${prefs.searchMode === 'training' ? ' mode-toggle__option--active' : ''}`}
+            onClick={() => prefs.set({ searchMode: 'training' })}
+          >
+            AI Generated
+          </button>
+        </div>
+        <span className="mode-toggle__hint">
+          {prefs.searchMode === 'web'
+            ? 'Finds real recipes from cooking sites.'
+            : "Claude invents recipes from its own training — faster, but not sourced from the web."}
+        </span>
       </div>
 
       <div className="sidebar-section">
@@ -257,6 +297,13 @@ export default function Sidebar({ isOpen, onClose }: Props) {
           onChange={(e) => prefs.set({ otherPreferences: e.target.value })}
           rows={3}
         />
+      </div>
+
+      <div
+        className={`usage-indicator${usage.remaining === 0 ? ' usage-indicator--exhausted' : ''}`}
+        title={usage.resetAt ? `Resets in ${timeUntil(usage.resetAt)}` : undefined}
+      >
+        {usage.remaining} of {usage.limit} generation{usage.limit === 1 ? '' : 's'} left today
       </div>
 
       <button className="btn-generate" onClick={generate} disabled={isLoading}>

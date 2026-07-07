@@ -15,3 +15,7 @@ services:
         sync: false
       - key: APP_URL
         sync: false
+      - key: FULL_ACCESS_CODE
+        sync: false
+      - key: COOKIE_SIGNING_SECRET
+        sync: false

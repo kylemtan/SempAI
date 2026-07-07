@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useAccessStore } from '../../store/useAccessStore';
 
 interface Props {
   resetAt: number; // epoch ms
@@ -15,6 +16,7 @@ function timeUntil(ms: number): string {
 }
 
 export default function RateLimitModal({ resetAt, onClose }: Props) {
+  const trusted = useAccessStore((s) => s.trusted);
   const [remaining, setRemaining] = useState(() => timeUntil(resetAt));
 
   useEffect(() => {
@@ -52,8 +54,15 @@ export default function RateLimitModal({ resetAt, onClose }: Props) {
           <div>
             <h2 style={{ fontSize: '1.2rem', fontWeight: 700, marginBottom: 6 }}>Daily limit reached</h2>
             <p style={{ color: 'var(--text-secondary, #888)', fontSize: '0.9rem', lineHeight: 1.6 }}>
-              SempAI is a demo that uses paid AI APIs. To keep it accessible without running up costs,
-              generation is limited to <strong>2 requests per day</strong> per visitor.
+              {trusted ? (
+                <>You've used all <strong>10 requests</strong> included with Full Access today.</>
+              ) : (
+                <>
+                  SempAI is a demo that uses paid AI APIs. You're in <strong>Demo Mode</strong>, limited to{' '}
+                  <strong>2 requests per day</strong>. Full Access — ask whoever shared this app with you —
+                  raises that to 10/day and also unlocks Claude-assisted shopping-list matching.
+                </>
+              )}
             </p>
           </div>
 

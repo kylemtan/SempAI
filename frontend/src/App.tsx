@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { useThemeStore } from './store/useThemeStore';
 import { useKrogerStore } from './store/useKrogerStore';
 import { useMealPlanStore } from './store/useMealPlanStore';
+import { useAccessStore } from './store/useAccessStore';
+import { useUsageStore } from './store/useUsageStore';
 import ThemeToggle from './components/ThemeToggle';
 import Sidebar from './components/Sidebar';
 import MealPlanView from './components/MealPlanView';
@@ -16,6 +18,9 @@ export default function App() {
   const initializeKroger = useKrogerStore((s) => s.initialize);
   const error = useMealPlanStore((s) => s.error);
   const clearError = useMealPlanStore((s) => s.clearError);
+  const trustedAccess = useAccessStore((s) => s.trusted);
+  const initializeAccess = useAccessStore((s) => s.initialize);
+  const refreshUsage = useUsageStore((s) => s.refresh);
 
   const isRateLimited = error?.startsWith('RATE_LIMITED:') ?? false;
   const rateLimitResetAt = isRateLimited ? parseInt(error!.split(':')[1]) : 0;
@@ -50,6 +55,8 @@ export default function App() {
       window.history.replaceState({}, '', window.location.pathname);
     }
     initializeKroger();
+    initializeAccess();
+    refreshUsage();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
@@ -111,6 +118,18 @@ export default function App() {
           >
             ?
           </button>
+          {trustedAccess ? (
+            <span className="access-badge" title="10 AI requests per day, plus Claude-assisted shopping matching, enabled for this browser">
+              🔓 Full Access
+            </span>
+          ) : (
+            <span
+              className="access-badge access-badge--demo"
+              title="Limited to 2 AI requests per day and the automatic shopping-match algorithm only. Ask whoever shared this app with you for a Full Access link."
+            >
+              Demo Mode
+            </span>
+          )}
           <ThemeToggle />
         </div>
       </header>

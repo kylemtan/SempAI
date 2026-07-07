@@ -27,6 +27,7 @@ export interface Preferences {
   numDays: number;
   leftovers: string;
   otherPreferences: string;
+  searchMode: 'web' | 'training';
 }
 
 export function todayISO(): string {
@@ -65,6 +66,7 @@ const defaults: Preferences = {
   numDays: 7,
   leftovers: '',
   otherPreferences: '',
+  searchMode: 'web',
 };
 
 interface PreferencesState extends Preferences {

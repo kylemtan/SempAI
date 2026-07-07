@@ -30,6 +30,7 @@ export interface ProductOption {
   stockLevel: string | null;
   imageUrl: string | null;
   categories: string[];
+  looksLikeIngredient: boolean;
 }
 
 export interface ProductSearchResult {
@@ -55,6 +56,7 @@ export async function searchKrogerProducts(
 export interface CartSelection {
   productId: string;
   displayName: string;
+  quantity: number;
 }
 
 export async function addToKrogerCart(selections: CartSelection[]): Promise<{ added: string[] }> {
@@ -66,4 +68,42 @@ export async function addToKrogerCart(selections: CartSelection[]): Promise<{ ad
   const json = (await res.json()) as { success: boolean; added: string[]; error?: string };
   if (!json.success) throw new Error(json.error ?? 'Failed to add to cart');
   return { added: json.added };
+}
+
+export interface ArbitrationCandidate {
+  productId: string;
+  brand: string;
+  description: string;
+  size: string;
+  regularPrice: number | null;
+  promoPrice: number | null;
+  stockLevel: string | null;
+}
+
+export interface ArbitrationItem {
+  key: string;
+  ingredientName: string;
+  searchTerm: string;
+  neededQuantity: string;
+  recipeContext?: string;
+  candidates: ArbitrationCandidate[];
+}
+
+export interface ArbitrationResult {
+  key: string;
+  productId: string | null;
+  confident?: boolean;
+  reason?: string;
+}
+
+export async function verifyProductMatches(items: ArbitrationItem[]): Promise<ArbitrationResult[]> {
+  const res = await fetch(`${BASE}/api/kroger/verify-matches`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items }),
+  });
+  if (res.status === 429) throw new Error('Verification rate limit reached — try again later.');
+  const json = (await res.json()) as { success: boolean; results: ArbitrationResult[]; error?: string };
+  if (!json.success) throw new Error(json.error ?? 'Verification failed');
+  return json.results;
 }

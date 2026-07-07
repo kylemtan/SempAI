@@ -31,6 +31,7 @@ export interface Recipe {
   sourceSite: string;
   sourceUrl: string | null;
   imageUrl: string | null;
+  aiGenerated?: boolean;
 }
 
 export interface Meal {

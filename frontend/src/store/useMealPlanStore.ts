@@ -3,6 +3,7 @@ import { persist } from 'zustand/middleware';
 import type { DayPlan, MealPlan, Recipe, ShoppingItem } from '../types/mealPlan';
 import { fetchMealPlan, fetchRegenMeals } from '../services/api';
 import { usePreferencesStore, todayISO } from './usePreferencesStore';
+import { useUsageStore } from './useUsageStore';
 
 function normalizeIngredientName(name: string): string {
   let n = name.trim();
@@ -72,6 +73,7 @@ export interface MealPlanRequest {
   numDays?: number;
   leftovers: string;
   otherPreferences: string;
+  searchMode?: 'web' | 'training';
   blacklist: string[];
   pinnedRecipes?: { name: string; cuisineHint: string; mealType: string }[];
   slotsToGenerate?: { day: string; date: string; mealType: string }[];
@@ -148,6 +150,7 @@ function buildPrefsPayload(
     numDays: prefs.numDays,
     leftovers: prefs.leftovers,
     otherPreferences: prefs.otherPreferences,
+    searchMode: prefs.searchMode,
     blacklist: activeBlacklist,
     ...extra,
   };
@@ -200,6 +203,8 @@ export const useMealPlanStore = create<MealPlanState>()(
             isLoading: false,
             progressMessage: '',
           });
+        } finally {
+          useUsageStore.getState().refresh();
         }
       },
 
@@ -300,6 +305,8 @@ export const useMealPlanStore = create<MealPlanState>()(
             isLoading: false,
             progressMessage: '',
           });
+        } finally {
+          useUsageStore.getState().refresh();
         }
       },
 
