@@ -1,4 +1,5 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
+import HowItWorksModal from './HowItWorksModal';
 
 interface Props {
   onClose: () => void;
@@ -66,6 +67,8 @@ const STEPS = [
 ];
 
 export default function HelpModal({ onClose }: Props) {
+  const [showHowItWorks, setShowHowItWorks] = useState(false);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
     document.addEventListener('keydown', onKey);
@@ -123,12 +126,17 @@ export default function HelpModal({ onClose }: Props) {
               ))}
             </ol>
           </section>
+
+          <button className="help-modal__learn-more" onClick={() => setShowHowItWorks(true)}>
+            How does recipe generation and shopping matching actually work? →
+          </button>
         </div>
 
         <div className="help-modal__footer">
           <button className="btn-primary" onClick={onClose}>Get started</button>
         </div>
       </div>
+      {showHowItWorks && <HowItWorksModal onClose={() => setShowHowItWorks(false)} />}
     </div>
   );
 }
