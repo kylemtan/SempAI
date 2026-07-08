@@ -4,37 +4,31 @@ import type { DayPlan, MealPlan, Recipe, ShoppingItem } from '../types/mealPlan'
 import { fetchMealPlan, fetchRegenMeals } from '../services/api';
 import { usePreferencesStore, todayISO } from './usePreferencesStore';
 import { useUsageStore } from './useUsageStore';
-
-function normalizeIngredientName(name: string): string {
-  let n = name.trim();
-  n = n.replace(/\s*\([^)]*\)/g, '');
-  n = n.replace(/,.*$/, '');
-  n = n.replace(
-    /\s+(for\s+(garnish|serving|topping)|to\s+(garnish|taste|serve|finish)|optional|as\s+needed|to\s+finish)\s*$/i,
-    ''
-  );
-  n = n.replace(
-    /^(freshly\s+|roughly\s+|finely\s+|thinly\s+|coarsely\s+|lightly\s+)?(fresh\s+)?(chopped|minced|diced|sliced|grated|shredded|peeled|cubed|torn|crumbled|crushed|trimmed|halved|quartered)\s+/i,
-    ''
-  );
-  return n.trim().toLowerCase();
-}
+import { canonicalIngredientKey, cleanIngredientName } from '../utils/ingredientKey';
 
 function toTitleCase(str: string): string {
   return str.replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 function buildShoppingList(days: DayPlan[]): ShoppingItem[] {
-  const map = new Map<string, { krogerSearchTerm: string; displayName: string; byUnit: Map<string, number>; usedIn: Set<string> }>();
+  const map = new Map<string, { krogerSearchTerm: string; displayName: string; displayLen: number; byUnit: Map<string, number>; usedIn: Set<string> }>();
   for (const day of days) {
     for (const meal of day.meals) {
       const recipeName = meal.recipe.name;
       for (const ing of meal.recipe.ingredients) {
-        const key = normalizeIngredientName(ing.name);
-        if (!map.has(key)) {
-          map.set(key, { krogerSearchTerm: ing.krogerSearchTerm, displayName: toTitleCase(key), byUnit: new Map(), usedIn: new Set() });
+        const key = canonicalIngredientKey(ing.name);
+        const cleaned = cleanIngredientName(ing.name);
+        let entry = map.get(key);
+        if (!entry) {
+          entry = { krogerSearchTerm: ing.krogerSearchTerm, displayName: toTitleCase(cleaned), displayLen: cleaned.length, byUnit: new Map(), usedIn: new Set() };
+          map.set(key, entry);
+        } else if (cleaned.length > entry.displayLen) {
+          // Prefer the more descriptive variant (e.g. "Extra Virgin Olive Oil" over
+          // "Olive Oil") as the display name once two ingredients merge into one row.
+          entry.displayName = toTitleCase(cleaned);
+          entry.displayLen = cleaned.length;
+          entry.krogerSearchTerm = ing.krogerSearchTerm;
         }
-        const entry = map.get(key)!;
         const unit = (ing.unit ?? '').toLowerCase().trim();
         entry.byUnit.set(unit, (entry.byUnit.get(unit) ?? 0) + (ing.quantity ?? 0));
         entry.usedIn.add(recipeName);
@@ -114,6 +108,7 @@ interface MealPlanState {
   favorites: FavoriteEntry[];
   pinnedFavoriteIds: string[];
   regenSelection: string[];
+  recentlyRegenerated: string[];
   shoppingListStale: boolean;
   cartedTerms: string[];
 
@@ -128,6 +123,7 @@ interface MealPlanState {
   togglePinFavorite: (id: string) => void;
   toggleRegenSelection: (day: string, mealType: string) => void;
   clearRegenSelection: () => void;
+  markMealSeen: (day: string, mealType: string) => void;
   addToCarted: (terms: string[]) => void;
   removeFromCarted: (term: string) => void;
   clearCarted: () => void;
@@ -167,6 +163,7 @@ export const useMealPlanStore = create<MealPlanState>()(
       favorites: [],
       pinnedFavoriteIds: [],
       regenSelection: [],
+      recentlyRegenerated: [],
       shoppingListStale: false,
       cartedTerms: [],
 
@@ -196,7 +193,7 @@ export const useMealPlanStore = create<MealPlanState>()(
           );
           get().addToBlacklist(newEntries);
 
-          set({ mealPlan, isLoading: false, progressMessage: '', pinnedFavoriteIds: [], shoppingListStale: false, cartedTerms: [] });
+          set({ mealPlan, isLoading: false, progressMessage: '', pinnedFavoriteIds: [], recentlyRegenerated: [], shoppingListStale: false, cartedTerms: [] });
         } catch (err) {
           set({
             error: err instanceof Error ? err.message : 'Something went wrong',
@@ -298,7 +295,15 @@ export const useMealPlanStore = create<MealPlanState>()(
             regenerated.map((r) => ({ id: r.recipe.id, name: r.recipe.name }))
           );
 
-          set({ mealPlan: updatedPlan, isLoading: false, progressMessage: '', regenSelection: [], shoppingListStale: false });
+          const newlyRegeneratedKeys = regenerated.map((r) => regenKey(r.day, r.mealType));
+          set((s) => ({
+            mealPlan: updatedPlan,
+            isLoading: false,
+            progressMessage: '',
+            regenSelection: [],
+            recentlyRegenerated: Array.from(new Set([...s.recentlyRegenerated, ...newlyRegeneratedKeys])),
+            shoppingListStale: false,
+          }));
         } catch (err) {
           set({
             error: err instanceof Error ? err.message : 'Something went wrong',
@@ -360,6 +365,11 @@ export const useMealPlanStore = create<MealPlanState>()(
       },
 
       clearRegenSelection: () => set({ regenSelection: [] }),
+
+      markMealSeen: (day, mealType) => {
+        const key = regenKey(day, mealType);
+        set((s) => ({ recentlyRegenerated: s.recentlyRegenerated.filter((k) => k !== key) }));
+      },
 
       addToCarted: (terms) =>
         set((s) => ({ cartedTerms: [...new Set([...s.cartedTerms, ...terms])] })),

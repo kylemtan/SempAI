@@ -127,7 +127,7 @@ export const usePreferencesStore = create<PreferencesState>()(
 );
 
 export const CUISINES = [
-  'American', 'Chinese', 'French', 'Greek', 'Indian',
+  'American', 'Caribbean', 'Chinese', 'Filipino', 'French', 'Greek', 'Indian',
   'Italian', 'Japanese', 'Korean', 'Mediterranean',
   'Mexican', 'Middle Eastern', 'Spanish', 'Thai', 'Vietnamese',
 ];

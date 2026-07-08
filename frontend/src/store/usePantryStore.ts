@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { detectCategory, type PantryCategory } from '../data/pantryData';
+import { canonicalIngredientKey } from '../utils/ingredientKey';
 
 export interface PantryItem {
   name: string;
@@ -12,6 +13,7 @@ interface PantryState {
   pantry: PantryItem[];
   addToPantry: (items: Array<{ name: string; category?: PantryCategory }>) => void;
   removeFromPantry: (name: string) => void;
+  setItemCategory: (name: string, category: PantryCategory) => void;
   clearPantry: () => void;
 }
 
@@ -22,9 +24,9 @@ export const usePantryStore = create<PantryState>()(
 
       addToPantry: (items) =>
         set((s) => {
-          const existing = new Set(s.pantry.map((p) => p.name.toLowerCase().trim()));
+          const existing = new Set(s.pantry.map((p) => canonicalIngredientKey(p.name)));
           const fresh: PantryItem[] = items
-            .filter((i) => i.name.trim() && !existing.has(i.name.toLowerCase().trim()))
+            .filter((i) => i.name.trim() && !existing.has(canonicalIngredientKey(i.name)))
             .map((i) => ({
               name: i.name.trim(),
               category: i.category ?? detectCategory(i.name),
@@ -36,7 +38,16 @@ export const usePantryStore = create<PantryState>()(
       removeFromPantry: (name) =>
         set((s) => ({
           pantry: s.pantry.filter(
-            (p) => p.name.toLowerCase().trim() !== name.toLowerCase().trim()
+            (p) => canonicalIngredientKey(p.name) !== canonicalIngredientKey(name)
+          ),
+        })),
+
+      setItemCategory: (name, category) =>
+        set((s) => ({
+          pantry: s.pantry.map((p) =>
+            canonicalIngredientKey(p.name) === canonicalIngredientKey(name)
+              ? { ...p, category }
+              : p
           ),
         })),
 

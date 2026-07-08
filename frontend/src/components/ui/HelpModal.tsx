@@ -3,56 +3,47 @@ import HowItWorksModal from './HowItWorksModal';
 
 interface Props {
   onClose: () => void;
+  onRestartTour: () => void;
 }
 
 const FEATURES = [
   {
-    icon: '🗓',
     title: 'Custom date range',
     body: 'Plan anywhere from 1 to 7 days starting on any date you choose.',
   },
   {
-    icon: '🍽',
     title: 'Flexible meals per day',
     body: 'Choose 1–6 meals per day — breakfast, lunch, dinner, and snacks.',
   },
   {
-    icon: '🥗',
     title: 'Dietary preferences',
     body: 'Set calorie, macro, and sodium targets. Filter by cuisine, allergens, and dietary lifestyle.',
   },
   {
-    icon: '⏱',
     title: 'Time constraints',
     body: 'Cap prep and cook time per recipe so every meal fits your schedule.',
   },
   {
-    icon: '⭐',
     title: 'Favorites & pinning',
     body: 'Star any recipe to save it. Pin favorites so they appear in your next generated plan.',
   },
   {
-    icon: '♻',
     title: 'Selective regeneration',
     body: 'Not happy with a meal? Select individual slots and regenerate just those.',
   },
   {
-    icon: '🛒',
     title: 'Shopping list',
-    body: 'Every plan comes with a combined shopping list. Connect Kroger to add items straight to your cart.',
+    body: 'Every plan comes with a combined shopping list and running total. Connect Kroger to add items straight to your cart, or manually review and swap products yourself.',
   },
   {
-    icon: '🏠',
     title: 'Pantry',
     body: 'Log ingredients you already have. Pantry items are separated in the shopping list and auto-added when you cart items.',
   },
   {
-    icon: '📄',
     title: 'Export',
     body: 'Export your plan as a PDF (schedule, shopping list, or all recipes) or add meals to any calendar app via .ics.',
   },
   {
-    icon: '🚫',
     title: 'Recent recipes',
     body: 'SempAI tracks recently generated recipes for 4 weeks so you always get variety.',
   },
@@ -63,10 +54,10 @@ const STEPS = [
   { n: '2', heading: 'Generate', body: 'Click Generate Meal Plan. SempAI plans your week, searches real recipe sites, and writes full recipes in parallel.' },
   { n: '3', heading: 'Browse your plan', body: 'Click any meal card to open the full recipe — ingredients, steps, macros, and a link to the source site.' },
   { n: '4', heading: 'Refine', body: 'Star meals to save them as favorites. Select unwanted slots and click Regenerate to swap them out.' },
-  { n: '5', heading: 'Shop', body: 'Open the Shopping List to review everything you need. Connect Kroger to add items to your cart in one click.' },
+  { n: '5', heading: 'Shop', body: 'Open the Shopping List to review everything you need and see the total. Connect Kroger to add items to your cart in one click, or manually review items yourself.' },
 ];
 
-export default function HelpModal({ onClose }: Props) {
+export default function HelpModal({ onClose, onRestartTour }: Props) {
   const [showHowItWorks, setShowHowItWorks] = useState(false);
 
   useEffect(() => {
@@ -100,9 +91,9 @@ export default function HelpModal({ onClose }: Props) {
           <section className="help-modal__section">
             <h3 className="help-modal__section-title">What you can do</h3>
             <div className="help-modal__features">
-              {FEATURES.map((f) => (
+              {FEATURES.map((f, i) => (
                 <div key={f.title} className="help-feature">
-                  <span className="help-feature__icon">{f.icon}</span>
+                  <span className="help-feature__num">{i + 1}</span>
                   <div>
                     <div className="help-feature__title">{f.title}</div>
                     <div className="help-feature__body">{f.body}</div>
@@ -133,6 +124,9 @@ export default function HelpModal({ onClose }: Props) {
         </div>
 
         <div className="help-modal__footer">
+          <button className="help-modal__restart-tour" onClick={onRestartTour}>
+            ↻ Restart tutorial
+          </button>
           <button className="btn-primary" onClick={onClose}>Get started</button>
         </div>
       </div>

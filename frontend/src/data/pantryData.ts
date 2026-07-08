@@ -21,6 +21,20 @@ export const PANTRY_CATEGORIES: PantryCategory[] = [
   'Other',
 ];
 
+// Decorative accent per category (dot + underline) — kept muted and clear of the
+// app's red accent color so it never reads as a destructive/interactive cue.
+export const PANTRY_CATEGORY_COLORS: Record<PantryCategory, string> = {
+  'Produce':            '#4C9A5B',
+  'Proteins':           '#C0703A',
+  'Grains & Starches':  '#B9922E',
+  'Dairy & Eggs':       '#4E85B8',
+  'Spices & Herbs':     '#7A9A3D',
+  'Oils & Condiments':  '#8B6BB0',
+  'Canned & Packaged':  '#6E7A93',
+  'Baking':             '#B9698F',
+  'Other':              '#8A8A80',
+};
+
 export interface IngredientSuggestion {
   name: string;
   category: PantryCategory;

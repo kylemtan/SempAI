@@ -37,7 +37,7 @@ export default function RateLimitModal({ resetAt, onClose }: Props) {
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div
-        className="modal"
+        className="modal modal--compact"
         style={{ maxWidth: 420, textAlign: 'center' }}
         onClick={(e) => e.stopPropagation()}
         role="dialog"
@@ -49,7 +49,7 @@ export default function RateLimitModal({ resetAt, onClose }: Props) {
         </div>
 
         <div className="modal__body" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px', paddingTop: 0 }}>
-          <span style={{ fontSize: '2.5rem' }}>⚠️</span>
+          <span style={{ fontSize: '2.5rem' }}>⚠</span>
 
           <div>
             <h2 style={{ fontSize: '1.2rem', fontWeight: 700, marginBottom: 6 }}>Daily limit reached</h2>

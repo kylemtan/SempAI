@@ -12,6 +12,7 @@ import FavoritesModal from './components/ui/FavoritesModal';
 import PantryModal from './components/ui/PantryModal';
 import HelpModal from './components/ui/HelpModal';
 import RateLimitModal from './components/ui/RateLimitModal';
+import GuidedTour from './components/GuidedTour';
 
 export default function App() {
   const theme = useThemeStore((s) => s.theme);
@@ -29,11 +30,18 @@ export default function App() {
   const [showFavorites, setShowFavorites] = useState(false);
   const [showBlacklist, setShowBlacklist] = useState(false);
   const [showPantry, setShowPantry] = useState(false);
-  const [showHelp, setShowHelp] = useState(() => {
-    const seen = localStorage.getItem('sempai-help-seen');
-    if (!seen) { localStorage.setItem('sempai-help-seen', '1'); return true; }
-    return false;
-  });
+  const [showHelp, setShowHelp] = useState(false);
+  const [showTour, setShowTour] = useState(() => !localStorage.getItem('sempai-tour-seen'));
+
+  function finishTour() {
+    localStorage.setItem('sempai-tour-seen', '1');
+    setShowTour(false);
+  }
+
+  function restartTour() {
+    setShowHelp(false);
+    setShowTour(true);
+  }
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
@@ -87,40 +95,36 @@ export default function App() {
             <span /><span /><span />
           </button>
           <div className="app-header__wordmark">
+            <img src="/favicon.svg" alt="" className="app-header__logo-mark" />
             <span className="app-header__logo">SempAI</span>
-            <span className="app-header__tagline">Smart and easy meal planning using AI, all in one place</span>
           </div>
-        </div>
-
-        <div className="app-header__actions">
           <button
             className="header-action-btn"
             onClick={() => setShowPantry(true)}
+            data-tour="pantry-btn"
           >
             Pantry
           </button>
           <button
             className="header-action-btn"
             onClick={() => setShowFavorites(true)}
+            data-tour="favorites-btn"
           >
             Favorites
           </button>
           <button
             className="header-action-btn"
             onClick={() => setShowBlacklist(true)}
+            data-tour="blacklist-btn"
           >
             Recent Recipes
           </button>
-          <button
-            className="header-action-btn header-action-btn--help"
-            onClick={() => setShowHelp(true)}
-            aria-label="Help"
-          >
-            ?
-          </button>
+        </div>
+
+        <div className="app-header__actions">
           {trustedAccess ? (
             <span className="access-badge" title="10 AI requests per day, plus Claude-assisted shopping matching, enabled for this browser">
-              🔓 Full Access
+              Full Access
             </span>
           ) : (
             <span
@@ -131,6 +135,14 @@ export default function App() {
             </span>
           )}
           <ThemeToggle />
+          <button
+            className="header-action-btn header-action-btn--help"
+            onClick={() => setShowHelp(true)}
+            aria-label="Help"
+            data-tour="help-btn"
+          >
+            ?
+          </button>
         </div>
       </header>
 
@@ -145,8 +157,16 @@ export default function App() {
       {showPantry && <PantryModal onClose={() => setShowPantry(false)} />}
       {showFavorites && <FavoritesModal onClose={() => setShowFavorites(false)} />}
       {showBlacklist && <BlacklistModal onClose={() => setShowBlacklist(false)} />}
-      {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
+      {showHelp && <HelpModal onClose={() => setShowHelp(false)} onRestartTour={restartTour} />}
       {isRateLimited && <RateLimitModal resetAt={rateLimitResetAt} onClose={clearError} />}
+      {showTour && (
+        <GuidedTour
+          onFinish={finishTour}
+          sidebarOpen={sidebarOpen}
+          onOpenSidebar={() => setSidebarOpen(true)}
+          onCloseSidebar={() => setSidebarOpen(false)}
+        />
+      )}
     </div>
   );
 }

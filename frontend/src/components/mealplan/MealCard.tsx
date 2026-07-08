@@ -20,7 +20,7 @@ const MEAL_TYPE_LABELS: Record<string, { jp: string; en: string }> = {
 
 export default function MealCard({ meal, day }: Props) {
   const [open, setOpen] = useState(false);
-  const { mealPlan, regenSelection, toggleRegenSelection } = useMealPlanStore();
+  const { mealPlan, regenSelection, toggleRegenSelection, recentlyRegenerated, markMealSeen } = useMealPlanStore();
   const { recipe } = meal;
   const totalTime = recipe.prepTime + recipe.cookTime;
   const label = MEAL_TYPE_LABELS[meal.mealType] ?? { jp: meal.mealType, en: meal.mealType };
@@ -28,15 +28,21 @@ export default function MealCard({ meal, day }: Props) {
   const canReplace = !!mealPlan;
   const key = regenKey(day, meal.mealType);
   const isSelected = regenSelection.includes(key);
+  const justRegenerated = recentlyRegenerated.includes(key);
+
+  function handleOpen() {
+    setOpen(true);
+    if (justRegenerated) markMealSeen(day, meal.mealType);
+  }
 
   return (
     <>
       <article
-        className={`meal-card${isSelected ? ' meal-card--selected' : ''}`}
-        onClick={() => setOpen(true)}
+        className={`meal-card${isSelected ? ' meal-card--selected' : ''}${justRegenerated ? ' meal-card--regenerated' : ''}`}
+        onClick={handleOpen}
         role="button"
         tabIndex={0}
-        onKeyDown={(e) => e.key === 'Enter' && setOpen(true)}
+        onKeyDown={(e) => e.key === 'Enter' && handleOpen()}
       >
         <div className="meal-card__top">
           <span className="meal-card__type-badge">
@@ -56,7 +62,7 @@ export default function MealCard({ meal, day }: Props) {
         <h3 className="meal-card__name">{recipe.name}</h3>
         <div className="meal-card__meta">
           <span className="meal-card__cuisine">{recipe.cuisine}</span>
-          <span className="meal-card__time">⏱ {totalTime}m</span>
+          <span className="meal-card__time">{totalTime}m</span>
           <span className="meal-card__calories">{recipe.macros.calories} kcal</span>
         </div>
       </article>

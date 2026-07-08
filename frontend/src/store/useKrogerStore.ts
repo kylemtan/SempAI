@@ -6,16 +6,23 @@ import { persist } from 'zustand/middleware';
 // see MATCH_MODE_POOL_SIZES in ShoppingListModal.tsx.
 export type ProductMatchMode = 'accuracy' | 'balanced' | 'price';
 
+// Sort applied to the per-ingredient candidate list in the manual product
+// browser (ShoppingListModal.tsx's "editing" phase). Persisted so the user's
+// preferred sort carries over between ingredients and future shopping trips.
+export type ProductSortKey = 'relevance' | 'kroger' | 'price-asc' | 'price-desc' | 'alpha-asc' | 'alpha-desc';
+
 interface KrogerState {
   isConnected: boolean;
   locationId: string | null;
   locationName: string | null;
   matchMode: ProductMatchMode;
+  candidateSort: ProductSortKey;
 
   initialize: () => Promise<void>;
   disconnect: () => Promise<void>;
   setLocation: (id: string, name: string) => void;
   setMatchMode: (mode: ProductMatchMode) => void;
+  setCandidateSort: (sort: ProductSortKey) => void;
 }
 
 export const useKrogerStore = create<KrogerState>()(
@@ -25,6 +32,7 @@ export const useKrogerStore = create<KrogerState>()(
       locationId: null,
       locationName: null,
       matchMode: 'balanced',
+      candidateSort: 'relevance',
 
       initialize: async () => {
         try {
@@ -47,6 +55,7 @@ export const useKrogerStore = create<KrogerState>()(
 
       setLocation: (id, name) => set({ locationId: id, locationName: name }),
       setMatchMode: (mode) => set({ matchMode: mode }),
+      setCandidateSort: (sort) => set({ candidateSort: sort }),
     }),
     {
       name: 'sempai-kroger',
@@ -54,6 +63,7 @@ export const useKrogerStore = create<KrogerState>()(
         locationId: s.locationId,
         locationName: s.locationName,
         matchMode: s.matchMode,
+        candidateSort: s.candidateSort,
         // isConnected intentionally not persisted — always derived from backend
       }),
     }

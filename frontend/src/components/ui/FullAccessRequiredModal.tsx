@@ -18,7 +18,7 @@ export default function FullAccessRequiredModal({ onClose }: Props) {
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div
-        className="modal"
+        className="modal modal--compact"
         style={{ maxWidth: 420, textAlign: 'center' }}
         onClick={(e) => e.stopPropagation()}
         role="dialog"
@@ -30,8 +30,6 @@ export default function FullAccessRequiredModal({ onClose }: Props) {
         </div>
 
         <div className="modal__body" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px', paddingTop: 0 }}>
-          <span style={{ fontSize: '2.5rem' }}>🔒</span>
-
           <div>
             <h2 style={{ fontSize: '1.2rem', fontWeight: 700, marginBottom: 6 }}>Full Access required</h2>
             <p style={{ color: 'var(--text-secondary, #888)', fontSize: '0.9rem', lineHeight: 1.6 }}>

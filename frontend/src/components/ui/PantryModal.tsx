@@ -3,19 +3,23 @@ import { usePantryStore } from '../../store/usePantryStore';
 import {
   INGREDIENT_SUGGESTIONS,
   PANTRY_CATEGORIES,
+  PANTRY_CATEGORY_COLORS,
   detectCategory,
   type PantryCategory,
 } from '../../data/pantryData';
+import { canonicalIngredientKey } from '../../utils/ingredientKey';
 
 interface Props {
   onClose: () => void;
 }
 
 export default function PantryModal({ onClose }: Props) {
-  const { pantry, addToPantry, removeFromPantry, clearPantry } = usePantryStore();
+  const { pantry, addToPantry, removeFromPantry, setItemCategory, clearPantry } = usePantryStore();
   const [query, setQuery] = useState('');
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [highlightedIdx, setHighlightedIdx] = useState(0);
+  const [draggingItem, setDraggingItem] = useState<string | null>(null);
+  const [dragOverCat, setDragOverCat] = useState<PantryCategory | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
@@ -31,7 +35,7 @@ export default function PantryModal({ onClose }: Props) {
   }, [onClose, dropdownOpen]);
 
   const pantryNameSet = useMemo(
-    () => new Set(pantry.map((p) => p.name.toLowerCase().trim())),
+    () => new Set(pantry.map((p) => canonicalIngredientKey(p.name))),
     [pantry]
   );
 
@@ -39,7 +43,18 @@ export default function PantryModal({ onClose }: Props) {
     const q = query.toLowerCase().trim();
     if (!q) return [];
     return INGREDIENT_SUGGESTIONS
-      .filter((s) => s.name.toLowerCase().includes(q) && !pantryNameSet.has(s.name.toLowerCase()))
+      .filter((s) => !pantryNameSet.has(canonicalIngredientKey(s.name)))
+      .map((s) => {
+        const name = s.name.toLowerCase();
+        const idx = name.indexOf(q);
+        if (idx === -1) return null;
+        // Rank: exact match > starts-with > match at a word boundary > mid-word match.
+        const score = name === q ? 0 : idx === 0 ? 1 : name[idx - 1] === ' ' ? 2 : 3;
+        return { s, score };
+      })
+      .filter((x): x is { s: (typeof INGREDIENT_SUGGESTIONS)[number]; score: number } => x !== null)
+      .sort((a, b) => a.score - b.score)
+      .map((x) => x.s)
       .slice(0, 8);
   }, [query, pantryNameSet]);
 
@@ -85,9 +100,13 @@ export default function PantryModal({ onClose }: Props) {
     return map;
   }, [pantry]);
 
-  const populatedCategories = PANTRY_CATEGORIES.filter(
-    (cat) => (byCategory.get(cat)?.length ?? 0) > 0
-  );
+  function handleDrop(cat: PantryCategory, e: React.DragEvent) {
+    e.preventDefault();
+    const name = e.dataTransfer.getData('text/plain');
+    if (name) setItemCategory(name, cat);
+    setDraggingItem(null);
+    setDragOverCat(null);
+  }
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -155,17 +174,40 @@ export default function PantryModal({ onClose }: Props) {
           ) : (
             <>
               <div className="pantry-grid">
-                {populatedCategories.map((cat) => {
+                {PANTRY_CATEGORIES.map((cat) => {
                   const items = byCategory.get(cat) ?? [];
-                  if (!items.length) return null;
                   return (
-                    <div key={cat} className="pantry-category">
-                      <h3 className="pantry-category__title">{cat}</h3>
+                    <div
+                      key={cat}
+                      className={`pantry-category${dragOverCat === cat ? ' pantry-category--drag-over' : ''}`}
+                      style={{ '--cat-color': PANTRY_CATEGORY_COLORS[cat] } as React.CSSProperties}
+                      onDragOver={(e) => { if (draggingItem) { e.preventDefault(); setDragOverCat(cat); } }}
+                      onDragLeave={() => setDragOverCat((c) => (c === cat ? null : c))}
+                      onDrop={(e) => handleDrop(cat, e)}
+                    >
+                      <h3 className="pantry-category__title">
+                        <span className="pantry-category__dot" />
+                        {cat}
+                        <span className="pantry-category__count">{items.length}</span>
+                      </h3>
                       <div className="pantry-category__chips">
+                        {items.length === 0 && (
+                          <span className="pantry-category__empty-hint">Drag items here</span>
+                        )}
                         {items
                           .sort((a, b) => a.name.localeCompare(b.name))
                           .map((item) => (
-                            <span key={item.name} className="pantry-chip">
+                            <span
+                              key={item.name}
+                              className={`pantry-chip${draggingItem === item.name ? ' pantry-chip--dragging' : ''}`}
+                              draggable
+                              onDragStart={(e) => {
+                                setDraggingItem(item.name);
+                                e.dataTransfer.setData('text/plain', item.name);
+                                e.dataTransfer.effectAllowed = 'move';
+                              }}
+                              onDragEnd={() => { setDraggingItem(null); setDragOverCat(null); }}
+                            >
                               {item.name}
                               <button
                                 className="pantry-chip__remove"

@@ -109,7 +109,7 @@ export default function Sidebar({ isOpen, onClose }: Props) {
   }, [syncScrollbar]);
 
   return (
-    <aside className={`sidebar${isOpen ? ' sidebar--open' : ''}`}>
+    <aside className={`sidebar${isOpen ? ' sidebar--open' : ''}`} data-tour="sidebar">
       <div ref={scrollRef} className="sidebar__scroll">
       <div className="sidebar__header">
         <h1 className="sidebar__title">Preferences</h1>
@@ -168,7 +168,15 @@ export default function Sidebar({ isOpen, onClose }: Props) {
       </div>
 
       <div className="sidebar-section">
-        <span className="sidebar-section__label">Cuisine</span>
+        <div className="sidebar-section__header">
+          <span className="sidebar-section__label">Cuisine</span>
+          <button
+            className="shopping-list__toggle-all"
+            onClick={() => prefs.set({ cuisines: prefs.cuisines.length === CUISINES.length ? [] : CUISINES })}
+          >
+            {prefs.cuisines.length === CUISINES.length ? 'Deselect all' : 'Select all'}
+          </button>
+        </div>
         <CheckboxGroup
           options={CUISINES}
           selected={prefs.cuisines}
@@ -306,7 +314,7 @@ export default function Sidebar({ isOpen, onClose }: Props) {
         {usage.remaining} of {usage.limit} generation{usage.limit === 1 ? '' : 's'} left today
       </div>
 
-      <button className="btn-generate" onClick={generate} disabled={isLoading}>
+      <button className="btn-generate" onClick={generate} disabled={isLoading} data-tour="generate-btn">
         {isLoading ? 'Generating…' : 'Generate Meal Plan'}
       </button>
       </div>

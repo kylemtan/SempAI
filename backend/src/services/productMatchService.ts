@@ -2,11 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// Haiku, not Sonnet — this is a short classification task over a handful of
-// product descriptions per ingredient, not recipe generation. Cheaper and
-// fast enough that batching several ingredients into one call still returns
-// quickly.
-const MODEL = 'claude-haiku-4-5-20251001';
+const MODEL = 'claude-sonnet-5';
 
 // Bounds the prompt regardless of how many raw Kroger results a search
 // returned — callers should already be capping to in-stock-preferred
@@ -91,6 +87,11 @@ export async function arbitrateProductMatches(items: ArbitrationItem[]): Promise
   const msg = await client.messages.create({
     model: MODEL,
     max_tokens: 150 + items.length * 60,
+    // Sonnet 5 defaults to adaptive thinking when this is omitted, which would
+    // put a `thinking` block ahead of the `text` block below and break the
+    // content[0] parsing — disable it, since this is a bounded classification
+    // task with a strict JSON output, not a reasoning task.
+    thinking: { type: 'disabled' },
     system: SYSTEM,
     messages: [{ role: 'user', content: buildPrompt(items) }],
   });

@@ -55,7 +55,7 @@ export default function MealPlanView() {
 
   if (isLoading) {
     return (
-      <main className="main-panel main-panel--centered">
+      <main className="main-panel main-panel--centered" data-tour="main-panel">
         <div className="loading-state">
           <div className="loading-spinner" />
           <div className="loading-log">
@@ -80,7 +80,7 @@ export default function MealPlanView() {
 
   if (error) {
     return (
-      <main className="main-panel main-panel--centered">
+      <main className="main-panel main-panel--centered" data-tour="main-panel">
         <div className="error-state">
           <p className="error-state__message">{error}</p>
           <button className="btn-dismiss" onClick={clearError}>Dismiss</button>
@@ -91,9 +91,9 @@ export default function MealPlanView() {
 
   if (!mealPlan) {
     return (
-      <main className="main-panel main-panel--centered">
+      <main className="main-panel main-panel--centered" data-tour="main-panel">
         <div className="empty-state">
-          <span className="empty-state__icon">🍱</span>
+          <img src="/favicon.svg" alt="" className="empty-state__icon" />
           <h2 className="empty-state__title">Your meal plan will appear here</h2>
           <p className="empty-state__body">
             Set your preferences in the sidebar and click <strong>Generate Meal Plan</strong> to create your weekly plan.
@@ -113,7 +113,7 @@ export default function MealPlanView() {
   }
 
   return (
-    <main className="main-panel">
+    <main className="main-panel" data-tour="main-panel">
       <div className="calendar-header">
         <div className="calendar-header__title-group">
           <span className="calendar-header__label">Meal Plan for</span>
@@ -124,6 +124,7 @@ export default function MealPlanView() {
             className="calendar-header__shopping-btn"
             onClick={() => setShowShoppingList(true)}
             disabled={shoppingCount === 0}
+            data-tour="shopping-btn"
           >
             Shopping List
             {shoppingCount > 0 && (
